@@ -39,6 +39,10 @@ create_data:
 	--to_agent $(to_agent) \
 	--dataset_version $(dataset_version)
 
+inspect_data:
+	python tools/inspect_sensor_data.py \
+	--sensor "gnss" \
+
 inspect_bev:
 	python tools/inspect_bev_sample.py \
     --data $(create_data_save_path) \
