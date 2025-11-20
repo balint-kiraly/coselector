@@ -7,7 +7,7 @@ def build_state_features(
     state_index: StateIndex,
     scene_id: int,
     frame_id: int,
-) -> Tuple[torch.Tensor, List[int]]:
+) -> torch.Tensor:
     """
     Get per-agent state features for the given scene/frame.
     Returns:

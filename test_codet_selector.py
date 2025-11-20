@@ -19,7 +19,9 @@ from coperception.models.det import *
 from coperception.utils.detection_util import late_fusion
 from coperception.utils.data_util import apply_pose_noise
 
+from data_utils.build_state_features import build_state_features
 from data_utils.state_index import StateIndex
+from selection.policy import select_agents_from_metadata, SelectionMethod
 
 
 def check_folder(folder_path):
@@ -246,9 +248,46 @@ def main(args):
         print(filenames)
 
         filename0 = filenames[0]
+
+        # --------------------------------------------------
+        # Agent selection: build state features, run policy
+        # --------------------------------------------------
+
+        parts = filename0.split(os.sep)
+        scene_frame = parts[-2]  # e.g. "12_5"
+        scene_id, frame_id = map(int, scene_frame.split("_"))
+
+        state_feats = build_state_features(
+            state_index=state_index,
+            scene_id=scene_id,
+            frame_id=frame_id,
+        )
+
+        selected_indices = select_agents_from_metadata(
+            state_feats,
+            method=SelectionMethod.IDENTITY
+        )
+
+        def _sel(lst):
+            return [lst[i] for i in selected_indices]
+
+        padded_voxel_point_list = _sel(padded_voxel_point_list)
+        padded_voxel_points_teacher_list = _sel(padded_voxel_points_teacher_list)
+        label_one_hot_list = _sel(label_one_hot_list)
+        reg_target_list = _sel(reg_target_list)
+        reg_loss_mask_list = _sel(reg_loss_mask_list)
+        anchors_map_list = _sel(anchors_map_list)
+        vis_maps_list = _sel(vis_maps_list)
+        target_agent_id_list = _sel(target_agent_id_list)
+        num_agent_list = _sel(num_agent_list)
+        trans_matrices_list = _sel(trans_matrices_list)
+
+        selected_num_agents = len(selected_indices)
+
         trans_matrices = torch.stack(tuple(trans_matrices_list), 1)
         target_agent_ids = torch.stack(tuple(target_agent_id_list), 1)
         num_all_agents = torch.stack(tuple(num_agent_list), 1)
+        num_all_agents[:] = selected_num_agents
 
         # add pose noise
         if pose_noise > 0:
