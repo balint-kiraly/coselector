@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import time
 from copy import deepcopy
 
@@ -17,6 +18,8 @@ from coperception.utils.mean_ap import eval_map
 from coperception.models.det import *
 from coperception.utils.detection_util import late_fusion
 from coperception.utils.data_util import apply_pose_noise
+
+from data_utils.state_index import StateIndex
 
 
 def check_folder(folder_path):
@@ -68,7 +71,7 @@ def main(args):
     # agent0 is the RSU
     agent_idx_range = range(num_agent) if args.rsu else range(1, num_agent)
     validation_dataset = V2XSimDet(
-        dataset_roots=[f"{args.data}/agent{i}" for i in agent_idx_range],
+        dataset_roots=[f"{args.data_prep}/agent{i}" for i in agent_idx_range],
         config=config,
         config_global=config_global,
         split="val",
@@ -81,6 +84,14 @@ def main(args):
         validation_dataset, batch_size=1, shuffle=False, num_workers=num_workers
     )
     print("Validation dataset size:", len(validation_dataset))
+
+    state_index = StateIndex(
+        dataroot=args.data,
+        scene_start=args.scene_begin,
+        scene_end=args.scens_end,
+        agent_start=0,
+        agent_end=6
+    )
 
     if not args.rsu:
         num_agent -= 1
@@ -500,6 +511,13 @@ if __name__ == "__main__":
         "--data",
         default=None,
         type=str,
+        help="The path to the original dataset",
+    )
+    parser.add_argument(
+        "-d",
+        "--data_prep",
+        default=None,
+        type=str,
         help="The path to the preprocessed sparse BEV training data",
     )
     parser.add_argument("--nepoch", default=100, type=int, help="Number of epochs")
@@ -581,6 +599,18 @@ if __name__ == "__main__":
         default=0,
         type=int,
         help="1: only v2i, 0: v2v and v2i",
+    )
+    parser.add_argument(
+        "--scene_begin",
+        default=0,
+        type=int,
+        help="The begin index of scenes to be evaluated",
+    )
+    parser.add_argument(
+        "--scene_end",
+        default=100,
+        type=int,
+        help="The end index of scenes to be evaluated",
     )
 
     torch.multiprocessing.set_sharing_strategy("file_system")

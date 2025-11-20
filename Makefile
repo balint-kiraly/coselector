@@ -52,7 +52,8 @@ inspect_bev:
 
 test:
 	python test_codet_selector.py \
-	--data $(testing_data) \
+	--data $(original_data_path) \
+	--data_prep $(testing_data)
 	--com $(com) \
 	--resume $(checkpoint_path)/$(com)/with_rsu/epoch_$(nepoch).pth \
 	--tracking \
@@ -60,3 +61,5 @@ test:
 	--apply_late_fusion $(apply_late_fusion) \
 	--visualization $(visualization) \
 	--rsu 1
+	--scene_begin 0 \
+	--scene_end 20
