@@ -8,6 +8,7 @@ import seaborn as sns
 import torch
 import torch.optim as optim
 from matplotlib import pyplot as plt
+from torch import nn
 from torch.utils.data import DataLoader
 
 from coperception.datasets import V2XSimDet
@@ -21,6 +22,7 @@ from coperception.utils.data_util import apply_pose_noise
 
 from data_utils.build_state_features import build_state_features
 from data_utils.state_index import StateIndex
+from selection.models import AgentSelectorMLP
 from selection.policy import select_agents_from_metadata, SelectionMethod
 
 
@@ -263,9 +265,21 @@ def main(args):
             frame_id=frame_id,
         )
 
+        # ------------------ Agent Selection Model ------------------
+        sel_model = None
+        if cnt == 0 and args.sel_method == "ml_model":
+            sel_model = AgentSelectorMLP(input_dim=state_feats.shape[1])
+            sel_model = sel_model.to(device)
+            #sel_model = nn.DataParallel(sel_model)
+            assert args.sel_model_path is not None, "Path to trained agent selection model is not provided"
+            sel_model.load_state_dict(torch.load(args.sel_model_path))
+            sel_model.eval()
+            print(f"Loaded agent selection model from {args.sel_model_path}")
+
         selected_indices = select_agents_from_metadata(
             state_feats,
-            method=SelectionMethod.IDENTITY
+            method=SelectionMethod(args.sel_method),
+            model=sel_model,
         )
 
         def _sel(lst):
@@ -650,6 +664,18 @@ if __name__ == "__main__":
         default=100,
         type=int,
         help="The end index of scenes to be evaluated",
+    )
+    parser.add_argument(
+        "--sel_method",
+        default="identity",
+        type=str,
+        help="Agent selection method: identity/ml_model/..."
+    )
+    parser.add_argument(
+        "sel_model_path",
+        default=None,
+        type=str,
+        help="Path to the trained agent selection model",
     )
 
     torch.multiprocessing.set_sharing_strategy("file_system")

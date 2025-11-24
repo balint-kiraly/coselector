@@ -62,4 +62,6 @@ test:
 	--visualization $(visualization) \
 	--rsu 1
 	--scene_begin 0 \
-	--scene_end 20
+	--scene_end 20 \
+	--sel_method "ml_model" \
+	--sel_mode_path "${checkpoint_path}/selector_models/agent_selector.pth"

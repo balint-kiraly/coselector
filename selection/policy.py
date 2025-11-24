@@ -79,10 +79,14 @@ def select_heuristic(state_features: torch.Tensor, **kwargs) -> List[int]:
     return list(range(state_features.shape[0]))
 
 
-def select_ml_model(state_features: torch.Tensor, model=None, threshold=0.5, **kwargs) -> List[int]:
+def select_ml_model(state_features: torch.Tensor, model, threshold=0.5, **kwargs) -> List[int]:
     """Use a trained neural model to pick agents."""
-    # TODO: implement
-    return list(range(state_features.shape[0]))
+    # state_features: (N, D)
+    with torch.no_grad():
+        scores = model(state_features)  # (N,)
+
+    idx = (scores > threshold).nonzero(as_tuple=True)[0]
+    return idx.cpu().tolist()
 
 
 def select_bandwidth_aware(state_features: torch.Tensor, budget: float = None, **kwargs) -> List[int]:
