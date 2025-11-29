@@ -591,7 +591,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "-r",
         "--root",
-        default="/mnt/NAS/home/yiming/NeurIPS2021-DiscoNet/V2X-Sim-1.0-raw",
         type=str,
         help="Root path to CoPerception dataset",
     )
@@ -602,8 +601,7 @@ if __name__ == "__main__":
     parser.add_argument("-e", "--scene_end", default=100, type=int, help="scene_end")
     parser.add_argument(
         "-p",
-        "--savepath",
-        default="/mnt/NAS/home/yiming/NeurIPS2021-DiscoNet/V2X-Sim-1.0-trainval/",
+        "--save_path",
         type=str,
         help="Directory for saving the generated data",
     )

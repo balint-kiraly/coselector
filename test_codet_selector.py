@@ -89,14 +89,6 @@ def main(args):
     )
     print("Validation dataset size:", len(validation_dataset))
 
-    state_index = StateIndex(
-        dataroot=args.data,
-        scene_start=args.scene_begin,
-        scene_end=args.scens_end,
-        agent_start=0,
-        agent_end=6
-    )
-
     if not args.rsu:
         num_agent -= 1
 
@@ -247,9 +239,7 @@ def main(args):
             trans_matrices_list,
         ) = zip(*sample)
 
-        print(filenames)
-
-        filename0 = filenames[0]
+        filename0 = filenames[0][0][0]
 
         # --------------------------------------------------
         # Agent selection: build state features, run policy
@@ -567,7 +557,6 @@ if __name__ == "__main__":
         help="The path to the original dataset",
     )
     parser.add_argument(
-        "-d",
         "--data_prep",
         default=None,
         type=str,
@@ -672,7 +661,7 @@ if __name__ == "__main__":
         help="Agent selection method: identity/ml_model/..."
     )
     parser.add_argument(
-        "sel_model_path",
+        "--sel_model_path",
         default=None,
         type=str,
         help="Path to the trained agent selection model",
