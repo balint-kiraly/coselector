@@ -1,3 +1,5 @@
+import json
+import os
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
 import math
@@ -39,6 +41,34 @@ class AgentMeta:
     lidar_rotation_hz: float = 20.0
 
 
+def _agent_meta_from_dict(d: dict) -> AgentMeta:
+    """Helper to build AgentMeta from a dict"""
+    return AgentMeta(
+        scene_id=d["scene_id"],
+        frame_id=d["frame_id"],
+        agent_id=d["agent_id"],
+        timestamp=d["timestamp"],
+        x=d["x"],
+        y=d["y"],
+        z=d["z"],
+        yaw=d["yaw"],
+        vx=d["vx"],
+        vy=d["vy"],
+        speed=d["speed"],
+        yaw_rate=d["yaw_rate"],
+        ax=d["ax"],
+        ay=d["ay"],
+        az=d["az"],
+        gx=d["gx"],
+        gy=d["gy"],
+        gz=d["gz"],
+        lidar_channels=d.get("lidar_channels", 32),
+        lidar_max_range_m=d.get("lidar_max_range_m", 70.0),
+        lidar_points_per_second=d.get("lidar_points_per_second", 250_000),
+        lidar_rotation_hz=d.get("lidar_rotation_hz", 20.0),
+    )
+
+
 class StateIndex:
     """
     Index over a V2X-Sim dataset (NuScenes format) that can answer:
@@ -58,7 +88,8 @@ class StateIndex:
         Only load scenes [scene_start, scene_end]
         and only agents [agent_start, agent_end]
         """
-        self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
+        self.dataroot = dataroot
+        self.nusc_version = version
         self.scene_start = scene_start
         self.scene_end = scene_end
         self.agent_start = agent_start
@@ -70,21 +101,84 @@ class StateIndex:
         # Helper for motion: (scene_id, agent_id) -> last (frame_id, AgentMeta)
         self.prev_state: Dict[Tuple[int, int], AgentMeta] = {}
 
-        self._build_index()
+    @classmethod
+    def from_fs(cls, root: str) -> "StateIndex":
+        """
+        Build a StateIndex from a folder tree:
 
+            root/
+              scene_000/
+                frame_000/
+                  agent_00.json
+                  agent_01.json
+                frame_001/
+              scene_001/
+                ...
+
+        Returns:
+            StateIndex with frame_index[(scene_id, frame_id)] -> List[AgentMeta]
+        """
+        self = cls.__new__(cls)   # bypass __init__
+
+        frame_index: Dict[Tuple[int, int], List[AgentMeta]] = {}
+
+        print("Loading index...")
+
+        for scene_name in sorted(os.listdir(root)):
+            if not scene_name.startswith("scene_"):
+                continue
+            scene_dir = os.path.join(root, scene_name)
+            if not os.path.isdir(scene_dir):
+                continue
+
+            try:
+                scene_id = int(scene_name.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+
+            for frame_name in sorted(os.listdir(scene_dir)):
+                if not frame_name.startswith("frame_"):
+                    continue
+                frame_dir = os.path.join(scene_dir, frame_name)
+                if not os.path.isdir(frame_dir):
+                    continue
+
+                try:
+                    frame_id = int(frame_name.split("_")[1])
+                except (IndexError, ValueError):
+                    continue
+
+                metas: List[AgentMeta] = []
+                for fname in sorted(os.listdir(frame_dir)):
+                    if not fname.endswith(".json"):
+                        continue
+                    fpath = os.path.join(frame_dir, fname)
+                    with open(fpath, "r") as f:
+                        d = json.load(f)
+                    metas.append(_agent_meta_from_dict(d))
+
+                frame_index[(scene_id, frame_id)] = metas
+
+        self.frame_index = frame_index
+        print("Index loaded.")
+        return self
 
     # ----------------------------------------------------------
     # Building the index
     # ----------------------------------------------------------
-    def _build_index(self):
+    def build_index(self):
+        nusc = NuScenes(version=self.nusc_version, dataroot=dataroot, verbose=True)
+
+        print("Loading index...")
+
         for scene_id in range(self.scene_start, self.scene_end):
-            scene = self.nusc.scene[scene_id]
+            scene = nusc.scene[scene_id]
 
             sample_token = scene["first_sample_token"]
             frame_id = 0
 
             while sample_token:
-                sample = self.nusc.get("sample", sample_token)
+                sample = nusc.get("sample", sample_token)
 
                 # For this frame, gather agents that appear (via GNSS_TOP_id_X)
                 metas = []
@@ -99,7 +193,7 @@ class StateIndex:
                         continue
 
                     # GNSS
-                    sd_gnss = self.nusc.get("sample_data", sd_token)
+                    sd_gnss = nusc.get("sample_data", sd_token)
                     sd_gnss_path = sd_gnss["filename"].replace("sweeps", "gnss")
                     gnss_arr = self._load_np(sd_gnss_path)
 
@@ -108,7 +202,7 @@ class StateIndex:
                     # IMU
                     imu_channel = f"IMU_TOP_id_{agent_id}"
                     imu_token = sample["data"][imu_channel]
-                    sd_imu = self.nusc.get("sample_data", imu_token)
+                    sd_imu = nusc.get("sample_data", imu_token)
                     sd_imu_path = sd_imu["filename"].replace("sweeps", "imu")
                     imu_arr = self._load_np(sd_imu_path).astype(float)
 
@@ -152,6 +246,8 @@ class StateIndex:
                 # Advance
                 sample_token = sample["next"]
                 frame_id += 1
+
+        print("Index loaded.")
 
 
     # ----------------------------------------------------------
@@ -200,7 +296,7 @@ class StateIndex:
         """
         import os
         import numpy as np
-        path = os.path.join(self.nusc.dataroot, sd_path)
+        path = os.path.join(self.dataroot, sd_path)
         return np.load(path)
 
 

@@ -67,6 +67,7 @@ test:
 	python test_codet_selector.py \
 	--data $(original_data_path) \
 	--data_prep $(testing_data)
+	--state_path $(create_state_data_save_path) \
 	--com $(com) \
 	--resume $(checkpoint_path)/$(com)/with_rsu/epoch_$(n_epoch).pth \
 	#--tracking \
@@ -79,4 +80,4 @@ test:
 	--sel_method "ml_model" \
 	--sel_model_path ${checkpoint_path}/selector_models/agent_selector.pth
 
-# --data ../data/V2X-Sim-2 --data_prep ./created_data/V2X-Sim-det/test	--com upperbound --resume checkpoints/upperbound/with_rsu/epoch_100.pth	--logpath logs --apply_late_fusion 1 --visualization 0 --rsu 1 --scene_begin 0	--scene_end 20 --sel_method "ml_model" --sel_model_path checkpoints/selector_models/agent_selector.pth
+# --data ../data/V2X-Sim-2 --data_prep ./created_data/V2X-Sim-det/test --state_path ./created_data/V2X-Sim-States --com upperbound --resume checkpoints/upperbound/with_rsu/epoch_100.pth	--logpath logs --apply_late_fusion 1 --visualization 0 --rsu 1 --scene_begin 0	--scene_end 20 --sel_method "ml_model" --sel_model_path checkpoints/selector_models/agent_selector.pth

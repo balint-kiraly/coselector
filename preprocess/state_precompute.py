@@ -60,6 +60,8 @@ def main():
         agent_end=6
     )
 
+    state_index.build_index()
+
     for (scene_id, frame_id), metas in state_index.frame_index.items():
         scene_dir = os.path.join(args.save_path, f"scene_{scene_id:03d}")
         os.makedirs(scene_dir, exist_ok=True)

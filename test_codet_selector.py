@@ -89,6 +89,9 @@ def main(args):
     )
     print("Validation dataset size:", len(validation_dataset))
 
+    # ===== load state index =====
+    state_index = StateIndex.from_fs(args.state_path)
+
     if not args.rsu:
         num_agent -= 1
 
@@ -561,6 +564,12 @@ if __name__ == "__main__":
         default=None,
         type=str,
         help="The path to the preprocessed sparse BEV training data",
+    )
+    parser.add_argument(
+        "--state_path",
+        default=None,
+        type=str,
+        help="The path to the state feature files for agent selection",
     )
     parser.add_argument("--nepoch", default=100, type=int, help="Number of epochs")
     parser.add_argument("--nworker", default=1, type=int, help="Number of workers")
