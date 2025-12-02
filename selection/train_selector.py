@@ -1,6 +1,13 @@
 import argparse
+import json
 import os
+from datetime import datetime
 from typing import List
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import torch
 from torch import optim, nn
@@ -42,11 +49,13 @@ def parse_args():
     p.add_argument("--selector_hidden_dim", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--lambda_cost", type=float, default=0.01,
+    p.add_argument("--lambda_cost", type=float, default=1000,
                    help="Bandwidth penalty weight.")
     p.add_argument("--reward_baseline_momentum", type=float, default=0.9)
 
     p.add_argument("--save_path", type=str, required=True,)
+    p.add_argument("--logs", type=str, default="logs",
+                   help="Directory to save plots and frame-level selections.")
 
     return p.parse_args()
 
@@ -60,6 +69,17 @@ def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ckpt_name = os.path.splitext(os.path.basename(args.ckpt))[0]
+    exp_name = (
+        f"selector_{ckpt_name}_sc{args.scene_start}-{args.scene_end}"
+        f"_ag{args.agent_start}-{args.agent_end}_ep{args.epochs}_{timestamp}"
+    )
+    os.makedirs(args.logs, exist_ok=True)
+    log_dir = os.path.join(args.logs, exp_name)
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"Logging to {log_dir}")
 
     # not include RSU
     args.agent_start = max(args.agent_start, 1)
@@ -152,10 +172,11 @@ def main():
     scene_frame = parts[-2]  # e.g. "12_5"
     scene_id, frame_id = map(int, scene_frame.split("_"))
 
-    state_feats0 = build_state_features(
+    state_feats0, _ = build_state_features(
         state_index=state_index,
         scene_id=scene_id,
         frame_id=frame_id,
+        return_meta=True,
     )
     input_dim = state_feats0.shape[1]
 
@@ -165,6 +186,10 @@ def main():
     # Baseline for REINFORCE (EMA of reward)
     baseline = 0.0
     beta = args.reward_baseline_momentum
+    frame_logs: List[dict] = []
+    loss_history: List[float] = []
+    reward_history: List[float] = []
+    frame_counter = 0
 
     # ------------------------------------------------------------------
     # RL training loop (per-frame bandit)
@@ -197,12 +222,14 @@ def main():
             scene_frame = parts[-2]  # e.g. "12_5"
             scene_id, frame_id = map(int, scene_frame.split("_"))
 
-            state_feats = build_state_features(
+            state_feats, metas = build_state_features(
                 state_index=state_index,
                 scene_id=scene_id,
                 frame_id=frame_id,
+                return_meta=True,
             )
             state_feats = state_feats.to(device)  # (N, D)
+            available_agent_ids = [m.agent_id for m in metas]
 
             padded_voxel_point_list = list(padded_voxel_point_list)
             padded_voxel_points_teacher_list = list(padded_voxel_points_teacher_list)
@@ -220,10 +247,12 @@ def main():
             probs = torch.sigmoid(logits)            # (N,)
             m = torch.distributions.Bernoulli(probs)
             actions = m.sample()                     # (N,)
-            log_probs = m.log_prob(actions)         # (N,)
+            log_probs = m.log_prob(actions)          # (N,)
 
             selected_indices = actions.nonzero(as_tuple=True)[0].cpu().tolist()
             num_selected = len(selected_indices)
+            selected_agent_ids = [available_agent_ids[i] for i in selected_indices]
+            det_loss_value = None
 
             if num_selected > 0:
                 # --- filter detection inputs according to selected agents ---
@@ -272,30 +301,123 @@ def main():
                     )
 
                 # reward: lower loss is better; penalize number of selected agents
-                reward = -det_loss - args.lambda_cost * float(num_selected)
+                det_loss_value = float(det_loss)
+                reward_value = -det_loss_value - args.lambda_cost * float(num_selected)
             else:
                 # no agents selected
-                reward = 0
+                reward_value = -10000.0
 
             # update baseline
-            baseline = beta * baseline + (1.0 - beta) * reward
-            advantage = reward - baseline
+            baseline = beta * baseline + (1.0 - beta) * reward_value
+            advantage = reward_value - baseline
 
             # --- RL loss (frame-level REINFORCE) ---
             # sum log_probs over all agents in this frame
             log_prob_sum = log_probs.sum()
 
-            loss = -log_prob_sum * advantage
+            loss = -log_prob_sum * torch.tensor(advantage, device=device)
 
+            loss_value = float(loss.item())
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
+            # frame-level logging
+            loss_history.append(loss_value)
+            reward_history.append(float(reward_value))
+            frame_logs.append(
+                {
+                    "epoch": epoch + 1,
+                    "frame_global_index": frame_counter,
+                    "scene_id": scene_id,
+                    "frame_id": frame_id,
+                    "available_agent_ids": available_agent_ids,
+                    "selected_indices": selected_indices,
+                    "selected_agent_ids": selected_agent_ids,
+                    "num_selected": num_selected,
+                    "num_available": len(available_agent_ids),
+                    "reward": float(reward_value),
+                    "loss": loss_value,
+                    "det_loss": det_loss_value,
+                    "actions": actions.detach().cpu().int().tolist(),
+                    "probs": probs.detach().cpu().tolist(),
+                }
+            )
+            frame_counter += 1
+
+            total_loss += loss_value
             total_frames += 1
+
 
         avg_loss = total_loss / max(1, total_frames)
         print(f"[Epoch {epoch+1}/{args.epochs}] RL loss per frame: {avg_loss:.4f}")
+
+    # ------------------------------------------------------------------
+    # Persist logs and plots
+    # ------------------------------------------------------------------
+    metrics_path = os.path.join(log_dir, "metrics.json")
+    frame_logs_path = os.path.join(log_dir, "frame_logs.json")
+    plots = {}
+
+    if frame_logs:
+        frame_indices = [log["frame_global_index"] for log in frame_logs]
+
+        # Agent selection scatter plot
+        plt.figure(figsize=(10, 5))
+        x_points = []
+        y_points = []
+        x_none = []
+        for log in frame_logs:
+            if log["selected_agent_ids"]:
+                x_points.extend([log["frame_global_index"]] * len(log["selected_agent_ids"]))
+                y_points.extend(log["selected_agent_ids"])
+            else:
+                x_none.append(log["frame_global_index"])
+        if x_points:
+            plt.scatter(x_points, y_points, s=14, alpha=0.7, label="Selected agents")
+        if x_none:
+            plt.scatter(x_none, [0] * len(x_none), marker="x", color="red", alpha=0.6, label="No agents selected")
+        plt.xlabel("Frame")
+        plt.ylabel("Agent ID (0 marks no selection)")
+        plt.title("Agent selections per frame")
+        plt.grid(True, linestyle="--", alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        selections_plot_path = os.path.join(log_dir, "agent_selections.png")
+        plt.savefig(selections_plot_path, dpi=200)
+        plt.close()
+        plots["agent_selections"] = selections_plot_path
+
+        # Loss and reward curves
+        plt.figure(figsize=(10, 5))
+        plt.plot(frame_indices, loss_history, label="RL loss")
+        plt.plot(frame_indices, reward_history, label="Reward")
+        plt.xlabel("Frame")
+        plt.ylabel("Value")
+        plt.title("RL loss and reward per frame")
+        plt.grid(True, linestyle="--", alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        lr_plot_path = os.path.join(log_dir, "loss_reward.png")
+        plt.savefig(lr_plot_path, dpi=200)
+        plt.close()
+        plots["loss_reward"] = lr_plot_path
+
+    with open(frame_logs_path, "w") as f:
+        json.dump(frame_logs, f, indent=2)
+
+    run_metadata = {
+        "experiment_name": exp_name,
+        "log_dir": log_dir,
+        "num_frames": len(frame_logs),
+        "args": vars(args),
+        "plots": plots,
+        "loss_history": loss_history,
+        "reward_history": reward_history,
+    }
+    with open(metrics_path, "w") as f:
+        json.dump(run_metadata, f, indent=2)
+    print(f"Saved frame logs and plots to {log_dir}")
 
     # ------------------------------------------------------------------
     # Save trained selector

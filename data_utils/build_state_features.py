@@ -1,5 +1,5 @@
 import torch
-from typing import List, Tuple
+from typing import List, Tuple, Union
 from .state_index import StateIndex, AgentMeta
 
 
@@ -7,11 +7,13 @@ def build_state_features(
     state_index: StateIndex,
     scene_id: int,
     frame_id: int,
-) -> torch.Tensor:
+    return_meta: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, List[AgentMeta]]]:
     """
     Get per-agent state features for the given scene/frame.
     Returns:
         feats: (N, D) tensor of state features for agents present in this frame.
+        metas: (optional) list of AgentMeta in the same order as feats.
     """
     metas: List[AgentMeta] = state_index.get_agents_meta(scene_id, frame_id)
 
@@ -40,4 +42,6 @@ def build_state_features(
         feat_rows.append(vec)
 
     feats = torch.stack(feat_rows, dim=0)  # (N_agents, 14)
+    if return_meta:
+        return feats, metas
     return feats
