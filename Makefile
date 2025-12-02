@@ -7,7 +7,7 @@ create_state_data_save_path := ./created_data/V2X-Sim-States
 # Index of the beginning scene
 scene_begin := 0
  # Index of the ending scene + 1
-scene_end := 100 # max 100
+scene_end := 1 # max 100
 # Index of the start agent
 from_agent := 0
 # Index of the end agent + 1
@@ -25,7 +25,7 @@ checkpoint_path := checkpoints
 # Where to store the logs
 log_path := logs
 # Train for how many epochs
-n_epoch := 20
+n_epoch := 100
 # 1: apply late fusion. 0: no late fusion
 apply_late_fusion := 1
 # 1: do visualization. 0: no visualization
@@ -69,15 +69,26 @@ test:
 	--data_prep $(testing_data)
 	--state_path $(create_state_data_save_path) \
 	--com $(com) \
-	--resume $(checkpoint_path)/$(com)/with_rsu/epoch_$(n_epoch).pth \
+	--resume $(checkpoint_path)/$(com)/with_rsu/epoch_$(n_epoch).pth \ #without?
 	#--tracking \
 	--logpath $(log_path) \
 	--apply_late_fusion $(apply_late_fusion) \
 	--visualization $(visualization) \
-	--rsu 1
+	--rsu 1 \
 	--scene_begin 0 \
 	--scene_end 20 \
 	--sel_method "ml_model" \
 	--sel_model_path ${checkpoint_path}/selector_models/agent_selector.pth
 
 # --data ../data/V2X-Sim-2 --data_prep ./created_data/V2X-Sim-det/test --state_path ./created_data/V2X-Sim-States --com upperbound --resume checkpoints/upperbound/with_rsu/epoch_100.pth	--logpath logs --apply_late_fusion 1 --visualization 0 --rsu 1 --scene_begin 0	--scene_end 20 --sel_method "ml_model" --sel_model_path checkpoints/selector_models/agent_selector.pth
+
+train_selector:
+	python -m selection.train_selector \
+	--data_det $(create_bev_data_save_path)/val \
+	--data_state $(create_state_data_save_path) \
+	--agent_start $(from_agent) \
+	--agent_end $(to_agent) \
+	--scene_start $(scene_begin) \
+	--scene_end $(scene_end) \
+	--ckpt $(checkpoint_path)/$(com)/no_rsu/epoch_$(n_epoch).pth \
+	--save_path $(checkpoint_path)/selector_models/agent_selector.pth

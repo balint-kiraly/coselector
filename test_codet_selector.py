@@ -225,6 +225,9 @@ def main(args):
     annotations_local = [[] for i in agent_idx_range]
 
     tracking_file = [set()] * num_agent
+
+    sel_model = None
+
     for cnt, sample in enumerate(validation_data_loader):
         t = time.time()
         (
@@ -257,9 +260,9 @@ def main(args):
             scene_id=scene_id,
             frame_id=frame_id,
         )
+        state_feats = state_feats.to(device)
 
         # ------------------ Agent Selection Model ------------------
-        sel_model = None
         if cnt == 0 and args.sel_method == "ml_model":
             sel_model = AgentSelectorMLP(input_dim=state_feats.shape[1])
             sel_model = sel_model.to(device)
