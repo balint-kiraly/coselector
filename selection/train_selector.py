@@ -21,6 +21,7 @@ from coperception.utils.CoDetModule import FaFModule
 from coperception.utils.loss import SoftmaxFocalClassificationLoss, WeightedSmoothL1LocalizationLoss
 from data_utils.build_state_features import build_state_features
 from data_utils.state_index import StateIndex
+from selection.bev_builder import assemble_detection_inputs
 from selection.models import AgentSelectorMLP
 
 from coperception.datasets import V2XSimDet
@@ -179,6 +180,39 @@ def compute_roi_bounds_from_rsu(metas, x_radius: float, y_radius: float):
     )
 
 
+def run_selection_strategy(state_feats, selector, strategy: str, topk: int):
+    """Dispatch to the requested selector strategy before BEV construction."""
+
+    num_agents = state_feats.shape[0]
+
+    if strategy == "identity":
+        # Keep everyone; no gradient contribution.
+        actions = torch.ones((num_agents,), device=state_feats.device)
+        log_probs = torch.zeros_like(actions)
+        return list(range(num_agents)), actions, log_probs, torch.ones_like(actions)
+
+    if strategy == "topk":
+        k = min(topk, num_agents)
+        # Assume the first two columns of the state features encode planar position.
+        distances = torch.norm(state_feats[:, :2], dim=1)
+        _, idx = torch.topk(distances, k=k, largest=False)
+        actions = torch.zeros((num_agents,), device=state_feats.device)
+        actions[idx] = 1.0
+        log_probs = torch.zeros_like(actions)
+        probs = torch.zeros_like(actions)
+        probs[idx] = 1.0
+        return idx.cpu().tolist(), actions, log_probs, probs
+
+    # Learned RL policy
+    logits = selector(state_feats)  # (N,)
+    probs = torch.sigmoid(logits)
+    distribution = torch.distributions.Bernoulli(probs)
+    actions = distribution.sample()
+    log_probs = distribution.log_prob(actions)
+    selected_indices = actions.nonzero(as_tuple=True)[0].cpu().tolist()
+    return selected_indices, actions, log_probs, probs
+
+
 def parse_args():
     p = argparse.ArgumentParser()
 
@@ -197,6 +231,30 @@ def parse_args():
     p.add_argument("--ckpt", type=str, required=True,
                    help="Detection model checkpoint to load.")
     p.add_argument("--num_workers", type=int, default=1)
+
+    # selector control / modes
+    p.add_argument(
+        "--mode",
+        choices=["train", "eval"],
+        default="train",
+        help="Whether to update the selector (train) or just log selections (eval).",
+    )
+    p.add_argument(
+        "--selector_strategy",
+        choices=["learned", "identity", "topk"],
+        default="learned",
+        help=(
+            "Selector to run before BEV extraction: RL policy (learned), "
+            "identity (keep all), or topk (nearest agents by distance feature)."
+        ),
+    )
+    p.add_argument(
+        "--selector_topk",
+        type=int,
+        default=3,
+        help="K for the top-k selector strategy (used only when selector_strategy=topk).",
+    )
+
 
     # RL selector
     p.add_argument("--selector_hidden_dim", type=int, default=64)
@@ -220,6 +278,15 @@ def parse_args():
         ),
     )
     p.add_argument("--reward_baseline_momentum", type=float, default=0.9)
+    p.add_argument(
+        "--use_raw_lidar",
+        action="store_true",
+        help=(
+            "If set, voxelize raw lidar for the selected agents on-the-fly so "
+            "selection truly happens before BEV construction. If unset, "
+            "precomputed BEVs from the dataset are used as a fallback."
+        ),
+    )
 
     p.add_argument("--save_path", type=str, required=True,)
     p.add_argument("--logs", type=str, default="logs",
@@ -291,13 +358,13 @@ def main():
     det_model.eval()
     for p in det_model.parameters():
         p.requires_grad = False
-    optimizer = optim.Adam(det_model.parameters(), lr=0.001)
+    det_optimizer = optim.Adam(det_model.parameters(), lr=0.001)
     criterion = {
         "cls": SoftmaxFocalClassificationLoss(),
         "loc": WeightedSmoothL1LocalizationLoss(),
     }
 
-    fafmodule = FaFModule(det_model, det_model, config, optimizer, criterion, 0)
+    fafmodule = FaFModule(det_model, det_model, config, det_optimizer, criterion, 0)
 
     checkpoint = torch.load(
         args.ckpt, map_location=device
@@ -349,7 +416,7 @@ def main():
     input_dim = state_feats0.shape[1]
 
     selector = AgentSelectorMLP(input_dim=input_dim, hidden_dim=args.selector_hidden_dim).to(device)
-    optimizer = torch.optim.Adam(selector.parameters(), lr=args.lr)
+    selector_optimizer = torch.optim.Adam(selector.parameters(), lr=args.lr)
 
     # Baseline for REINFORCE (EMA of reward)
     baseline = 0.0
@@ -370,20 +437,43 @@ def main():
         total_frames = 0
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            (
-                padded_voxel_point_list,
-                padded_voxel_points_teacher_list,
-                label_one_hot_list,
-                reg_target_list,
-                reg_loss_mask_list,
-                anchors_map_list,
-                vis_maps_list,
-                gt_max_iou,
-                filenames,
-                target_agent_id_list,
-                num_agent_list,
-                trans_matrices_list,
-            ) = zip(*batch)
+            batch_fields = list(zip(*batch))
+            if len(batch_fields) == 12:
+                (
+                    padded_voxel_point_list,
+                    padded_voxel_points_teacher_list,
+                    label_one_hot_list,
+                    reg_target_list,
+                    reg_loss_mask_list,
+                    anchors_map_list,
+                    vis_maps_list,
+                    gt_max_iou,
+                    filenames,
+                    target_agent_id_list,
+                    num_agent_list,
+                    trans_matrices_list,
+                ) = batch_fields
+                raw_lidar_list = None
+            elif len(batch_fields) == 13:
+                (
+                    padded_voxel_point_list,
+                    padded_voxel_points_teacher_list,
+                    label_one_hot_list,
+                    reg_target_list,
+                    reg_loss_mask_list,
+                    anchors_map_list,
+                    vis_maps_list,
+                    gt_max_iou,
+                    filenames,
+                    target_agent_id_list,
+                    num_agent_list,
+                    trans_matrices_list,
+                    raw_lidar_list,
+                ) = batch_fields
+            else:
+                raise ValueError(
+                    f"Unexpected batch size {len(batch_fields)}; expected 12 or 13 fields (got {len(batch_fields)})."
+                )
 
             # --- build state features ---
             filename0 = filenames[0][0][0]
@@ -424,96 +514,79 @@ def main():
             target_agent_id_list = list(target_agent_id_list)
             num_agent_list = list(num_agent_list)
             trans_matrices_list = list(trans_matrices_list)
+            raw_lidar_list = list(raw_lidar_list) if raw_lidar_list is not None else None
 
             # --- policy: logits -> probs -> Bernoulli sample ---
-            logits = selector(state_feats)           # (N,)
-            probs = torch.sigmoid(logits)            # (N,)
-            m = torch.distributions.Bernoulli(probs)
-            actions = m.sample()                     # (N,)
-            log_probs = m.log_prob(actions)          # (N,)
-
-            selected_indices = actions.nonzero(as_tuple=True)[0].cpu().tolist()
+            # Selector runs *before* any BEV feature extraction so that only the
+            # chosen agents incur voxelization/fusion cost.
+            selected_indices, actions, log_probs, probs = run_selection_strategy(
+                state_feats, selector, args.selector_strategy, args.selector_topk
+            )
             num_selected = len(selected_indices)
             selected_agent_ids = [available_agent_ids[i] for i in selected_indices]
             det_loss_value = None
             metric_roi = 0.0
+            bev_build_mode = "raw_lidar" if (args.use_raw_lidar and raw_lidar_list is not None) else "precomputed"
 
             if num_selected > 0:
-                # --- filter detection inputs according to selected agents ---
-                def _sel(lst):
-                    return [lst[i] for i in selected_indices]
+                # --- filter detection inputs according to selected agents (pre-BEV if raw lidar is available) ---
+                raw_pc_sel = None
+                if args.use_raw_lidar and raw_lidar_list is not None:
+                    raw_pc_sel = [raw_lidar_list[i] for i in selected_indices]
 
-                pvp_list_sel = _sel(padded_voxel_point_list)
-                pvp_teacher_list_sel = _sel(padded_voxel_points_teacher_list)
-                label_list_sel = _sel(label_one_hot_list)
-                reg_target_list_sel = _sel(reg_target_list)
-                reg_loss_mask_list_sel = _sel(reg_loss_mask_list)
-                anchors_list_sel = _sel(anchors_map_list)
-                vis_maps_list_sel = _sel(vis_maps_list)
-                target_agent_id_list_sel = _sel(target_agent_id_list)
-                num_agent_list_sel = _sel(num_agent_list)
-                trans_mats_list_sel = _sel(trans_matrices_list)
-                gt_list_sel = _sel(gt_max_iou)
-
-                trans_matrices = torch.stack(tuple(trans_mats_list_sel), 1).to(device)
-                target_agent_ids = torch.stack(tuple(target_agent_id_list_sel), 1).to(device)
-                num_all_agents = torch.tensor([[num_selected]], dtype=torch.int64, device=device)
-
-                # Choose which BEV tensor to feed:
-                #  - upperbound/teacher BEV provides oracle fusion features but bypasses
-                #    the selector (all agents already fused).
-                #  - raw agent BEV (default) keeps selection meaningful because only
-                #    chosen agents' raw features reach the detector.
-                if args.use_teacher_bev:
-                    padded_voxel_points = torch.cat(tuple(pvp_teacher_list_sel), 0).to(device)
-                else:
-                    padded_voxel_points = torch.cat(tuple(pvp_list_sel), 0).to(device)
-                label_one_hot = torch.cat(tuple(label_list_sel), 0).to(device)
-                reg_target = torch.cat(tuple(reg_target_list_sel), 0).to(device)
-                reg_loss_mask = torch.cat(tuple(reg_loss_mask_list_sel), 0).to(device)
-                anchors_map = torch.cat(tuple(anchors_list_sel), 0).to(device)
-                vis_maps = torch.cat(tuple(vis_maps_list_sel), 0).to(device)
-
-                data = {
-                    "bev_seq": padded_voxel_points,
-                    "labels": label_one_hot,
-                    "reg_targets": reg_target,
-                    "anchors": anchors_map,
-                    "vis_maps": vis_maps,
-                    "reg_loss_mask": reg_loss_mask.bool(),
-                    "target_agent_ids": target_agent_ids,
-                    "num_agent": num_all_agents,
-                    "trans_matrices": trans_matrices,
-                }
-
-                # --- run detection model (frozen) ---
-                with torch.no_grad():
-                    det_loss, cls_loss, loc_loss, result = fafmodule.predict_all(
-                        data, batch_size=1, num_agent=num_selected
-                    )
-
-                # --- ROI-filtered metric (optimize detection around RSU crossroad) ---
-                # Compute F1 inside the configured ROI using only selected agents' predictions/GTs.
-                metric_roi = compute_f1_roi(
-                    result,
-                    gt_list_sel,
-                    roi_x_min,
-                    roi_x_max,
-                    roi_y_min,
-                    roi_y_max,
-                    args.roi_iou_thresh,
+                data, num_agents = assemble_detection_inputs(
+                    selected_indices=selected_indices,
+                    raw_point_clouds=raw_pc_sel,
+                    precomputed_bevs=padded_voxel_point_list,
+                    teacher_bevs=padded_voxel_points_teacher_list,
+                    labels=label_one_hot_list,
+                    reg_targets=reg_target_list,
+                    reg_loss_masks=reg_loss_mask_list,
+                    anchors=anchors_map_list,
+                    vis_maps=vis_maps_list,
+                    trans_matrices_list=trans_matrices_list,
+                    target_agent_id_list=target_agent_id_list,
+                    device=device,
+                    config=config,
+                    use_teacher_bev=args.use_teacher_bev,
                 )
 
-                # reward: higher ROI metric is better; still penalize number of selected agents
-                det_loss_value = float(det_loss)
-                reward_value = metric_roi - args.lambda_cost * float(num_selected)
+                if num_agents > 0:
+                    gt_list_sel = [gt_max_iou[i] for i in selected_indices]
+
+                    # --- run detection model (frozen) ---
+                    with torch.no_grad():
+                        det_loss, cls_loss, loc_loss, result = fafmodule.predict_all(
+                            data, batch_size=1, num_agent=num_agents
+                        )
+
+                    # --- ROI-filtered metric (optimize detection around RSU crossroad) ---
+                    # Compute F1 inside the configured ROI using only selected agents' predictions/GTs.
+                    metric_roi = compute_f1_roi(
+                        result,
+                        gt_list_sel,
+                        roi_x_min,
+                        roi_x_max,
+                        roi_y_min,
+                        roi_y_max,
+                        args.roi_iou_thresh,
+                    )
+
+                    # reward: higher ROI metric is better; still penalize number of selected agents
+                    det_loss_value = float(det_loss)
+                    reward_value = metric_roi - args.lambda_cost * float(num_selected)
+                else:
+                    reward_value = -10000.0
             else:
                 # no agents selected
                 reward_value = -10000.0
 
-            # update baseline
-            baseline = beta * baseline + (1.0 - beta) * reward_value
-            advantage = reward_value - baseline
+            # update baseline only when learning
+            if args.selector_strategy == "learned":
+                baseline = beta * baseline + (1.0 - beta) * reward_value
+                advantage = reward_value - baseline
+            else:
+                advantage = reward_value
 
             # --- RL loss (frame-level REINFORCE) ---
             # sum log_probs over all agents in this frame
@@ -522,9 +595,11 @@ def main():
             loss = -log_prob_sum * torch.tensor(advantage, device=device)
 
             loss_value = float(loss.item())
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+
+            if args.mode == "train" and args.selector_strategy == "learned":
+                selector_optimizer.zero_grad()
+                loss.backward()
+                selector_optimizer.step()
 
             # frame-level logging
             loss_history.append(loss_value)
@@ -546,6 +621,9 @@ def main():
                     "roi_metric_f1": metric_roi,
                     "actions": actions.detach().cpu().int().tolist(),
                     "probs": probs.detach().cpu().tolist(),
+                    "selector_strategy": args.selector_strategy,
+                    "mode": args.mode,
+                    "bev_build_mode": bev_build_mode,
                 }
             )
             frame_counter += 1
