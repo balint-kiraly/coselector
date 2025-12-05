@@ -436,10 +436,26 @@ def main():
                     trans_matrices_list,
                     raw_lidar_list,
                 ) = batch_fields
+            elif len(batch_fields) == 12:
+                (
+                    padded_voxel_point_list,
+                    padded_voxel_points_teacher_list,
+                    label_one_hot_list,
+                    reg_target_list,
+                    reg_loss_mask_list,
+                    anchors_map_list,
+                    vis_maps_list,
+                    gt_max_iou,
+                    filenames,
+                    target_agent_id_list,
+                    num_agent_list,
+                    trans_matrices_list,
+                ) = batch_fields
+                raw_lidar_list = None
             else:
                 raise ValueError(
-                    "Raw lidar is required so selection can run before BEV construction; "
-                    f"expected 13 fields including raw point clouds but got {len(batch_fields)}."
+                    "Unexpected batch structure; expected 12 or 13 fields from V2XSimDet "
+                    f"but got {len(batch_fields)}."
                 )
 
             # --- build state features ---
@@ -481,7 +497,8 @@ def main():
             target_agent_id_list = list(target_agent_id_list)
             num_agent_list = list(num_agent_list)
             trans_matrices_list = list(trans_matrices_list)
-            raw_lidar_list = list(raw_lidar_list)
+            if raw_lidar_list is not None:
+                raw_lidar_list = list(raw_lidar_list)
 
             # --- policy: logits -> probs -> Bernoulli sample ---
             # Selector runs *before* any BEV feature extraction so that only the
@@ -495,11 +512,13 @@ def main():
             metric_roi = 0.0
             if num_selected > 0:
                 # --- filter detection inputs according to selected agents (pre-BEV if raw lidar is available) ---
-                raw_pc_sel = [raw_lidar_list[i] for i in selected_indices]
+                raw_pc_sel = [raw_lidar_list[i] for i in selected_indices] if raw_lidar_list else None
+                bev_sel = [padded_voxel_point_list[i] for i in selected_indices] if raw_pc_sel is None else None
 
                 data, num_agents = assemble_detection_inputs(
                     selected_indices=selected_indices,
                     raw_point_clouds=raw_pc_sel,
+                    precomputed_bevs=bev_sel,
                     labels=label_one_hot_list,
                     reg_targets=reg_target_list,
                     reg_loss_masks=reg_loss_mask_list,
