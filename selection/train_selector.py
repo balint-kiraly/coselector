@@ -268,25 +268,7 @@ def parse_args():
                    help="Half-height of ROI in meters (centered on RSU/agent 0).")
     p.add_argument("--roi_iou_thresh", type=float, default=0.5,
                    help="IoU threshold for ROI true positives.")
-    p.add_argument(
-        "--use_teacher_bev",
-        action="store_true",
-        help=(
-            "If set, feed the upperbound/teacher BEV tensor to the detector. "
-            "Leave unset to use each selected agent's own BEV so the selector "
-            "actually gates which raw inputs reach the detector."
-        ),
-    )
     p.add_argument("--reward_baseline_momentum", type=float, default=0.9)
-    p.add_argument(
-        "--use_raw_lidar",
-        action="store_true",
-        help=(
-            "If set, voxelize raw lidar for the selected agents on-the-fly so "
-            "selection truly happens before BEV construction. If unset, "
-            "precomputed BEVs from the dataset are used as a fallback."
-        ),
-    )
 
     p.add_argument("--save_path", type=str, required=True,)
     p.add_argument("--logs", type=str, default="logs",
@@ -438,23 +420,7 @@ def main():
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
             batch_fields = list(zip(*batch))
-            if len(batch_fields) == 12:
-                (
-                    padded_voxel_point_list,
-                    padded_voxel_points_teacher_list,
-                    label_one_hot_list,
-                    reg_target_list,
-                    reg_loss_mask_list,
-                    anchors_map_list,
-                    vis_maps_list,
-                    gt_max_iou,
-                    filenames,
-                    target_agent_id_list,
-                    num_agent_list,
-                    trans_matrices_list,
-                ) = batch_fields
-                raw_lidar_list = None
-            elif len(batch_fields) == 13:
+            if len(batch_fields) == 13:
                 (
                     padded_voxel_point_list,
                     padded_voxel_points_teacher_list,
@@ -472,7 +438,8 @@ def main():
                 ) = batch_fields
             else:
                 raise ValueError(
-                    f"Unexpected batch size {len(batch_fields)}; expected 12 or 13 fields (got {len(batch_fields)})."
+                    "Raw lidar is required so selection can run before BEV construction; "
+                    f"expected 13 fields including raw point clouds but got {len(batch_fields)}."
                 )
 
             # --- build state features ---
@@ -514,7 +481,7 @@ def main():
             target_agent_id_list = list(target_agent_id_list)
             num_agent_list = list(num_agent_list)
             trans_matrices_list = list(trans_matrices_list)
-            raw_lidar_list = list(raw_lidar_list) if raw_lidar_list is not None else None
+            raw_lidar_list = list(raw_lidar_list)
 
             # --- policy: logits -> probs -> Bernoulli sample ---
             # Selector runs *before* any BEV feature extraction so that only the
@@ -526,19 +493,13 @@ def main():
             selected_agent_ids = [available_agent_ids[i] for i in selected_indices]
             det_loss_value = None
             metric_roi = 0.0
-            bev_build_mode = "raw_lidar" if (args.use_raw_lidar and raw_lidar_list is not None) else "precomputed"
-
             if num_selected > 0:
                 # --- filter detection inputs according to selected agents (pre-BEV if raw lidar is available) ---
-                raw_pc_sel = None
-                if args.use_raw_lidar and raw_lidar_list is not None:
-                    raw_pc_sel = [raw_lidar_list[i] for i in selected_indices]
+                raw_pc_sel = [raw_lidar_list[i] for i in selected_indices]
 
                 data, num_agents = assemble_detection_inputs(
                     selected_indices=selected_indices,
                     raw_point_clouds=raw_pc_sel,
-                    precomputed_bevs=padded_voxel_point_list,
-                    teacher_bevs=padded_voxel_points_teacher_list,
                     labels=label_one_hot_list,
                     reg_targets=reg_target_list,
                     reg_loss_masks=reg_loss_mask_list,
@@ -548,7 +509,6 @@ def main():
                     target_agent_id_list=target_agent_id_list,
                     device=device,
                     config=config,
-                    use_teacher_bev=args.use_teacher_bev,
                 )
 
                 if num_agents > 0:
@@ -623,7 +583,6 @@ def main():
                     "probs": probs.detach().cpu().tolist(),
                     "selector_strategy": args.selector_strategy,
                     "mode": args.mode,
-                    "bev_build_mode": bev_build_mode,
                 }
             )
             frame_counter += 1

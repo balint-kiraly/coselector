@@ -6,7 +6,7 @@ selector decides which agents to keep, we voxelize only those agents' raw
 point clouds and hand just those BEVs to the detection model.
 """
 
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple
 
 import torch
 
@@ -55,9 +55,7 @@ def voxelize_selected_points(
 def assemble_detection_inputs(
     *,
     selected_indices: Sequence[int],
-    raw_point_clouds: Optional[Sequence[torch.Tensor]],
-    precomputed_bevs: Sequence[torch.Tensor],
-    teacher_bevs: Optional[Sequence[torch.Tensor]],
+    raw_point_clouds: Sequence[torch.Tensor],
     labels: Sequence[torch.Tensor],
     reg_targets: Sequence[torch.Tensor],
     reg_loss_masks: Sequence[torch.Tensor],
@@ -67,15 +65,12 @@ def assemble_detection_inputs(
     target_agent_id_list: Sequence[torch.Tensor],
     device: torch.device,
     config,
-    use_teacher_bev: bool = False,
 ) -> Tuple[dict, int]:
     """
     Build the detector input dict using only the selected agents.
 
-    If ``raw_point_clouds`` is provided, BEVs are voxelized lazily for the
-    selected subset; otherwise we fall back to the precomputed BEVs already
-    stored on disk. This keeps the selector in front of feature extraction
-    while maintaining compatibility with existing detection code.
+    BEVs are voxelized lazily for the selected subset using their raw point
+    clouds so that selection happens *before* BEV construction and fusion.
     """
 
     if not selected_indices:
@@ -84,13 +79,7 @@ def assemble_detection_inputs(
     def _select(seq: Sequence, use_indices: Sequence[int]):
         return [seq[i] for i in use_indices]
 
-    if raw_point_clouds is not None:
-        bev_seq = voxelize_selected_points(raw_point_clouds, selected_indices, config, device)
-    else:
-        if use_teacher_bev and teacher_bevs is not None:
-            bev_seq = torch.cat(tuple(_select(teacher_bevs, selected_indices)), dim=0).to(device)
-        else:
-            bev_seq = torch.cat(tuple(_select(precomputed_bevs, selected_indices)), dim=0).to(device)
+    bev_seq = voxelize_selected_points(raw_point_clouds, selected_indices, config, device)
 
     label_one_hot = torch.cat(tuple(_select(labels, selected_indices)), dim=0).to(device)
     reg_target = torch.cat(tuple(_select(reg_targets, selected_indices)), dim=0).to(device)
