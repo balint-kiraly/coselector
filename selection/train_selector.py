@@ -26,6 +26,159 @@ from selection.models import AgentSelectorMLP
 from coperception.datasets import V2XSimDet
 
 
+def filter_boxes_in_roi(
+    boxes: torch.Tensor,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+) -> torch.Tensor:
+    """Return a boolean mask for boxes whose centers fall inside the ROI."""
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.bool, device=boxes.device)
+    x_center = boxes[:, 0]
+    y_center = boxes[:, 1]
+    return (x_center >= x_min) & (x_center <= x_max) & (y_center >= y_min) & (y_center <= y_max)
+
+
+def compute_f1_roi(
+    result,
+    gt_list,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    iou_thresh: float,
+) -> float:
+    """
+    Compute an ROI-only detection F1 score.
+
+    - Predictions and ground truths are filtered to the ROI using center coordinates.
+    - Predictions are not confidence-thresholded (all scores are considered).
+    - Greedy matching uses axis-aligned IoU on (x, y, w, l) with a fixed threshold.
+    - Returns a scalar in [0, 1]; falls back to 0 when no GT exists in ROI.
+    """
+
+    def _prep_boxes(pred_entry):
+        if len(pred_entry) == 0:
+            return torch.empty((0, 7)), torch.empty((0,))
+        pred_dict = pred_entry[0][0][0]  # predict_all output format
+        preds = pred_dict.get("pred", torch.empty((0, 7)))
+        scores = pred_dict.get("score", torch.empty((len(preds),)))
+        if not isinstance(preds, torch.Tensor):
+            preds = torch.as_tensor(preds)
+        if not isinstance(scores, torch.Tensor):
+            scores = torch.as_tensor(scores)
+        return preds, scores
+
+    def _prep_gt(gt_entry):
+        if len(gt_entry[0]["gt_box"]) == 0:
+            return torch.empty((0, 7))
+        gt = gt_entry[0]["gt_box"][0]
+        if not isinstance(gt, torch.Tensor):
+            gt = torch.as_tensor(gt)
+        return gt
+
+    pred_boxes_all = []
+    gt_boxes_all = []
+    pred_scores_all = []
+
+    for pred_entry, gt_entry in zip(result, gt_list):
+        preds, scores = _prep_boxes(pred_entry)
+        gts = _prep_gt(gt_entry)
+
+        if preds.numel() > 0:
+            roi_mask = filter_boxes_in_roi(preds, x_min, x_max, y_min, y_max)
+            preds = preds[roi_mask]
+            scores = scores[roi_mask]
+        if gts.numel() > 0:
+            gts = gts[filter_boxes_in_roi(gts, x_min, x_max, y_min, y_max)]
+
+        if preds.numel() > 0:
+            pred_boxes_all.append(preds)
+            pred_scores_all.append(scores)
+        if gts.numel() > 0:
+            gt_boxes_all.append(gts)
+
+    if not gt_boxes_all:
+        return 0.0
+    if not pred_boxes_all:
+        return 0.0
+
+    pred_boxes = torch.cat(pred_boxes_all, dim=0)
+    pred_scores = torch.cat(pred_scores_all, dim=0)
+    gt_boxes = torch.cat(gt_boxes_all, dim=0)
+
+    # Sort predictions by confidence for greedy matching
+    _, sort_idx = torch.sort(pred_scores, descending=True)
+    pred_boxes = pred_boxes[sort_idx]
+
+    # Helper: convert center-format box to axis-aligned corners
+    def _box_to_corners(box):
+        x_c, y_c, w, l = float(box[0]), float(box[1]), float(box[3]), float(box[4])
+        half_w = w / 2.0
+        half_l = l / 2.0
+        return x_c - half_l, y_c - half_w, x_c + half_l, y_c + half_w
+
+    gt_used = torch.zeros((gt_boxes.shape[0],), dtype=torch.bool)
+    tp = 0
+
+    for pred_box in pred_boxes:
+        px1, py1, px2, py2 = _box_to_corners(pred_box)
+        best_iou = 0.0
+        best_gt_idx = -1
+        for gt_idx, gt_box in enumerate(gt_boxes):
+            if gt_used[gt_idx]:
+                continue
+            gx1, gy1, gx2, gy2 = _box_to_corners(gt_box)
+            inter_x1 = max(px1, gx1)
+            inter_y1 = max(py1, gy1)
+            inter_x2 = min(px2, gx2)
+            inter_y2 = min(py2, gy2)
+            inter_w = max(0.0, inter_x2 - inter_x1)
+            inter_h = max(0.0, inter_y2 - inter_y1)
+            inter_area = inter_w * inter_h
+            if inter_area <= 0:
+                continue
+            pred_area = (px2 - px1) * (py2 - py1)
+            gt_area = (gx2 - gx1) * (gy2 - gy1)
+            union = pred_area + gt_area - inter_area
+            iou = inter_area / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou = iou
+                best_gt_idx = gt_idx
+        if best_gt_idx >= 0 and best_iou >= iou_thresh:
+            tp += 1
+            gt_used[best_gt_idx] = True
+
+    fp = pred_boxes.shape[0] - tp
+    fn = gt_boxes.shape[0] - tp
+
+    denom = (2 * tp + fp + fn)
+    if denom == 0:
+        return 0.0
+    return float((2 * tp) / denom)
+
+
+def compute_roi_bounds_from_rsu(metas, x_radius: float, y_radius: float):
+    """Center the ROI on the RSU (agent 0) location for the current frame."""
+
+    for meta in metas:
+        if meta.agent_id == 0:
+            x_c = float(meta.x)
+            y_c = float(meta.y)
+            return (
+                x_c - x_radius,
+                x_c + x_radius,
+                y_c - y_radius,
+                y_c + y_radius,
+            )
+
+    raise ValueError(
+        "RSU (agent 0) metadata missing for this frame; cannot center ROI on RSU."
+    )
+
+
 def parse_args():
     p = argparse.ArgumentParser()
 
@@ -51,6 +204,12 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lambda_cost", type=float, default=1000,
                    help="Bandwidth penalty weight.")
+    p.add_argument("--roi_x_radius", type=float, default=10.0,
+                   help="Half-width of ROI in meters (centered on RSU/agent 0).")
+    p.add_argument("--roi_y_radius", type=float, default=10.0,
+                   help="Half-height of ROI in meters (centered on RSU/agent 0).")
+    p.add_argument("--roi_iou_thresh", type=float, default=0.5,
+                   help="IoU threshold for ROI true positives.")
     p.add_argument("--reward_baseline_momentum", type=float, default=0.9)
 
     p.add_argument("--save_path", type=str, required=True,)
@@ -190,6 +349,7 @@ def main():
     loss_history: List[float] = []
     reward_history: List[float] = []
     frame_counter = 0
+    rsu_missing_warned = False
 
     # ------------------------------------------------------------------
     # RL training loop (per-frame bandit)
@@ -231,6 +391,20 @@ def main():
             state_feats = state_feats.to(device)  # (N, D)
             available_agent_ids = [m.agent_id for m in metas]
 
+            # Center ROI on RSU (agent 0) for this frame.
+            try:
+                roi_x_min, roi_x_max, roi_y_min, roi_y_max = compute_roi_bounds_from_rsu(
+                    metas, args.roi_x_radius, args.roi_y_radius
+                )
+            except ValueError as e:
+                if not rsu_missing_warned:
+                    print(f"Warning: {e}")
+                    rsu_missing_warned = True
+                # Fall back to origin-centered ROI to keep training running, but this
+                # should be fixed in the metadata so the ROI tracks the RSU properly.
+                roi_x_min, roi_x_max = -args.roi_x_radius, args.roi_x_radius
+                roi_y_min, roi_y_max = -args.roi_y_radius, args.roi_y_radius
+
             padded_voxel_point_list = list(padded_voxel_point_list)
             padded_voxel_points_teacher_list = list(padded_voxel_points_teacher_list)
             label_one_hot_list = list(label_one_hot_list)
@@ -253,6 +427,7 @@ def main():
             num_selected = len(selected_indices)
             selected_agent_ids = [available_agent_ids[i] for i in selected_indices]
             det_loss_value = None
+            metric_roi = 0.0
 
             if num_selected > 0:
                 # --- filter detection inputs according to selected agents ---
@@ -269,6 +444,7 @@ def main():
                 target_agent_id_list_sel = _sel(target_agent_id_list)
                 num_agent_list_sel = _sel(num_agent_list)
                 trans_mats_list_sel = _sel(trans_matrices_list)
+                gt_list_sel = _sel(gt_max_iou)
 
                 trans_matrices = torch.stack(tuple(trans_mats_list_sel), 1).to(device)
                 target_agent_ids = torch.stack(tuple(target_agent_id_list_sel), 1).to(device)
@@ -300,9 +476,21 @@ def main():
                         data, batch_size=1, num_agent=num_selected
                     )
 
-                # reward: lower loss is better; penalize number of selected agents
+                # --- ROI-filtered metric (optimize detection around RSU crossroad) ---
+                # Compute F1 inside the configured ROI using only selected agents' predictions/GTs.
+                metric_roi = compute_f1_roi(
+                    result,
+                    gt_list_sel,
+                    roi_x_min,
+                    roi_x_max,
+                    roi_y_min,
+                    roi_y_max,
+                    args.roi_iou_thresh,
+                )
+
+                # reward: higher ROI metric is better; still penalize number of selected agents
                 det_loss_value = float(det_loss)
-                reward_value = -det_loss_value - args.lambda_cost * float(num_selected)
+                reward_value = metric_roi - args.lambda_cost * float(num_selected)
             else:
                 # no agents selected
                 reward_value = -10000.0
@@ -339,6 +527,7 @@ def main():
                     "reward": float(reward_value),
                     "loss": loss_value,
                     "det_loss": det_loss_value,
+                    "roi_metric_f1": metric_roi,
                     "actions": actions.detach().cpu().int().tolist(),
                     "probs": probs.detach().cpu().tolist(),
                 }
