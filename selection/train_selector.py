@@ -161,8 +161,40 @@ def compute_f1_roi(
     return float((2 * tp) / denom)
 
 
-def compute_roi_bounds_from_rsu(metas, x_radius: float, y_radius: float):
-    """Center the ROI on the RSU (agent 0) location for the current frame."""
+def _extract_rsu_xy_from_transforms(trans_matrices_list) -> tuple:
+    """Try to recover the RSU (agent 0) x/y from dataloader transforms.
+
+    V2XSimDet stores a per-agent ``trans_matrices`` tensor where the first
+    transform (index 0) corresponds to the RSU/cross-road frame. When the
+    RSU is missing from the GNSS/IMU state index, we can still pull its
+    translation from these transforms to keep the ROI centered on the RSU.
+    """
+
+    for trans in trans_matrices_list:
+        if trans is None:
+            continue
+        trans_tensor = torch.as_tensor(trans)
+        # Expected shape: (num_agents_in_scene, 4, 4)
+        if trans_tensor.ndim == 3 and trans_tensor.shape[-2:] == (4, 4):
+            if trans_tensor.shape[0] == 0:
+                continue
+            rsu_tf = trans_tensor[0]
+            x_c = float(rsu_tf[0, 3])
+            y_c = float(rsu_tf[1, 3])
+            return x_c, y_c
+    return None
+
+
+def compute_roi_bounds_from_rsu(
+    metas, x_radius: float, y_radius: float, trans_matrices_list=None
+):
+    """
+    Center the ROI on the RSU (agent 0) location for the current frame.
+
+    Prefer GNSS/IMU metadata (if the RSU exists in the state index); otherwise
+    fall back to the RSU translation embedded in the detection dataloader's
+    transformation matrices.
+    """
 
     for meta in metas:
         if meta.agent_id == 0:
@@ -175,8 +207,22 @@ def compute_roi_bounds_from_rsu(metas, x_radius: float, y_radius: float):
                 y_c + y_radius,
             )
 
+    rsu_xy = None
+    if trans_matrices_list is not None:
+        rsu_xy = _extract_rsu_xy_from_transforms(trans_matrices_list)
+
+    if rsu_xy is not None:
+        x_c, y_c = rsu_xy
+        return (
+            x_c - x_radius,
+            x_c + x_radius,
+            y_c - y_radius,
+            y_c + y_radius,
+        )
+
     raise ValueError(
-        "RSU (agent 0) metadata missing for this frame; cannot center ROI on RSU."
+        "RSU (agent 0) metadata missing for this frame and no RSU transform was"
+        " available from the dataloader to center the ROI."
     )
 
 
@@ -476,7 +522,10 @@ def main():
             # Center ROI on RSU (agent 0) for this frame.
             try:
                 roi_x_min, roi_x_max, roi_y_min, roi_y_max = compute_roi_bounds_from_rsu(
-                    metas, args.roi_x_radius, args.roi_y_radius
+                    metas,
+                    args.roi_x_radius,
+                    args.roi_y_radius,
+                    trans_matrices_list=trans_matrices_list,
                 )
             except ValueError as e:
                 if not rsu_missing_warned:
