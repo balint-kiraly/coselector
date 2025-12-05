@@ -210,6 +210,15 @@ def parse_args():
                    help="Half-height of ROI in meters (centered on RSU/agent 0).")
     p.add_argument("--roi_iou_thresh", type=float, default=0.5,
                    help="IoU threshold for ROI true positives.")
+    p.add_argument(
+        "--use_teacher_bev",
+        action="store_true",
+        help=(
+            "If set, feed the upperbound/teacher BEV tensor to the detector. "
+            "Leave unset to use each selected agent's own BEV so the selector "
+            "actually gates which raw inputs reach the detector."
+        ),
+    )
     p.add_argument("--reward_baseline_momentum", type=float, default=0.9)
 
     p.add_argument("--save_path", type=str, required=True,)
@@ -450,8 +459,15 @@ def main():
                 target_agent_ids = torch.stack(tuple(target_agent_id_list_sel), 1).to(device)
                 num_all_agents = torch.tensor([[num_selected]], dtype=torch.int64, device=device)
 
-                # choose teacher or normal bev (here just use normal)
-                padded_voxel_points = torch.cat(tuple(pvp_teacher_list_sel), 0).to(device)
+                # Choose which BEV tensor to feed:
+                #  - upperbound/teacher BEV provides oracle fusion features but bypasses
+                #    the selector (all agents already fused).
+                #  - raw agent BEV (default) keeps selection meaningful because only
+                #    chosen agents' raw features reach the detector.
+                if args.use_teacher_bev:
+                    padded_voxel_points = torch.cat(tuple(pvp_teacher_list_sel), 0).to(device)
+                else:
+                    padded_voxel_points = torch.cat(tuple(pvp_list_sel), 0).to(device)
                 label_one_hot = torch.cat(tuple(label_list_sel), 0).to(device)
                 reg_target = torch.cat(tuple(reg_target_list_sel), 0).to(device)
                 reg_loss_mask = torch.cat(tuple(reg_loss_mask_list_sel), 0).to(device)
