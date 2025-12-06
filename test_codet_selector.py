@@ -279,6 +279,8 @@ def main(args):
             model=sel_model,
         )
 
+        selected_num_agents = len(selected_indices)
+
         def _sel(lst):
             return [lst[i] for i in selected_indices]
 
@@ -336,10 +338,10 @@ def main(args):
                 loc_loss,
                 result,
                 save_agent_weight_list,
-            ) = fafmodule.predict_all(data, 1, num_agent=num_agent)
+            ) = fafmodule.predict_all(data, 1, num_agent=selected_num_agents)
         else:
             loss, cls_loss, loc_loss, result = fafmodule.predict_all(
-                data, 1, num_agent=num_agent
+                data, 1, num_agent=selected_num_agents
             )
 
         box_color_map = ["red", "yellow", "blue", "purple", "black", "orange"]

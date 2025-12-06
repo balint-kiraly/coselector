@@ -109,7 +109,7 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=1,
-        shuffle=True,
+        shuffle=True, # can be set to True later
         num_workers=args.num_workers
     )
     print(f"Train dataset size: {len(train_dataset)} samples.")
@@ -250,7 +250,8 @@ def main():
             actions = m.sample()                     # (N,)
             log_probs = m.log_prob(actions)          # (N,)
 
-            selected_indices = actions.nonzero(as_tuple=True)[0].cpu().tolist()
+            #selected_indices = actions.nonzero(as_tuple=True)[0].cpu().tolist()
+            selected_indices = [i for i in range(len(actions))] # temporary: select all agents
             num_selected = len(selected_indices)
             selected_agent_ids = [available_agent_ids[i] for i in selected_indices]
             det_loss_value = None
