@@ -65,7 +65,7 @@ def assemble_detection_inputs(
     device: torch.device,
     config,
     raw_point_clouds: Optional[Sequence[torch.Tensor]] = None,
-    precomputed_bevs: Optional[Sequence[torch.Tensor]] = None,
+    precomputed_bevs: Sequence[torch.Tensor] = None,
 ) -> Tuple[dict, int]:
     """
     Build the detector input dict using only the selected agents.

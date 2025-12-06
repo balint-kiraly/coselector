@@ -162,26 +162,30 @@ def compute_f1_roi(
 
 
 def _extract_rsu_xy_from_transforms(trans_matrices_list) -> tuple:
-    """Try to recover the RSU (agent 0) x/y from dataloader transforms.
+    """Extract the RSU (agent 0) x/y from dataloader transforms.
 
-    V2XSimDet stores a per-agent ``trans_matrices`` tensor where the first
-    transform (index 0) corresponds to the RSU/cross-road frame. When the
-    RSU is missing from the GNSS/IMU state index, we can still pull its
-    translation from these transforms to keep the ROI centered on the RSU.
+    The RSU transform is guaranteed to be the first element and is expected
+    to be a 4x4 matrix (or a batched tensor with shape (N,4,4)). Return (x,y)
+    or None if not available.
     """
+    if not trans_matrices_list:
+        return None
 
-    for trans in trans_matrices_list:
-        if trans is None:
-            continue
-        trans_tensor = torch.as_tensor(trans)
-        # Expected shape: (num_agents_in_scene, 4, 4)
-        if trans_tensor.ndim == 3 and trans_tensor.shape[-2:] == (4, 4):
-            if trans_tensor.shape[0] == 0:
-                continue
-            rsu_tf = trans_tensor[0]
-            x_c = float(rsu_tf[0, 3])
-            y_c = float(rsu_tf[1, 3])
-            return x_c, y_c
+    trans = trans_matrices_list[0]
+    if trans is None:
+        return None
+
+    trans_tensor = torch.as_tensor(trans)[0]
+
+    # If we have a batched tensor (num_agents, 4, 4), take index 0
+    if trans_tensor.ndim == 3 and trans_tensor.shape[-2:] == (4, 4):
+        if trans_tensor.shape[0] == 0:
+            return None
+        rsu_tf = trans_tensor[0]
+        x_c = float(rsu_tf[0, 3])
+        y_c = float(rsu_tf[1, 3])
+        return x_c, y_c
+
     return None
 
 
@@ -255,7 +259,7 @@ def parse_args():
 
     p.add_argument("--scene_start", type=int, default=0)
     p.add_argument("--scene_end", type=int, default=100)
-    p.add_argument("--agent_start", type=int, default=1)
+    p.add_argument("--agent_start", type=int, default=0)
     p.add_argument("--agent_end", type=int, default=6)
 
     # model
@@ -297,7 +301,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     ckpt_name = os.path.splitext(os.path.basename(args.ckpt))[0]
     exp_name = (
-        f"selector_{ckpt_name}_sc{args.scene_start}-{args.scene_end}"
+        f"selector_{ckpt_name}_sc{args.scene_start}-{args.scene_end-1}"
         f"_ag{args.agent_start}-{args.agent_end}_ep{args.epochs}_{timestamp}"
     )
     os.makedirs(args.logs, exist_ok=True)
@@ -305,9 +309,9 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     print(f"Logging to {log_dir}")
 
-    # not include RSU
-    args.agent_start = max(args.agent_start, 1)
-    num_agent = args.agent_end - args.agent_start + 1
+    # include RSU
+    args.agent_start = min(args.agent_start, 0)
+    num_agent = args.agent_end - args.agent_start
 
     # ------------------------------------------------------------------
     # Build detection dataset + dataloader (train split)
@@ -332,7 +336,7 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=1,
-        shuffle=True,
+        shuffle=False, # can be set to True later
         num_workers=args.num_workers
     )
     print(f"Train dataset size: {len(train_dataset)} samples.")
@@ -368,7 +372,7 @@ def main():
     # ------------------------------------------------------------------
     # Build state index (GNSS/IMU)
     # ------------------------------------------------------------------
-    state_index = StateIndex.from_fs(args.data_state)
+    state_index = StateIndex.from_fs(args.data_state) # does not include RSU
 
     # ------------------------------------------------------------------
     # Build selector policy
@@ -427,23 +431,7 @@ def main():
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
             batch_fields = list(zip(*batch))
-            if len(batch_fields) == 13:
-                (
-                    padded_voxel_point_list,
-                    padded_voxel_points_teacher_list,
-                    label_one_hot_list,
-                    reg_target_list,
-                    reg_loss_mask_list,
-                    anchors_map_list,
-                    vis_maps_list,
-                    gt_max_iou,
-                    filenames,
-                    target_agent_id_list,
-                    num_agent_list,
-                    trans_matrices_list,
-                    raw_lidar_list,
-                ) = batch_fields
-            elif len(batch_fields) == 12:
+            if len(batch_fields) == 12:
                 (
                     padded_voxel_point_list,
                     padded_voxel_points_teacher_list,
@@ -458,10 +446,9 @@ def main():
                     num_agent_list,
                     trans_matrices_list,
                 ) = batch_fields
-                raw_lidar_list = None
             else:
                 raise ValueError(
-                    "Unexpected batch structure; expected 12 or 13 fields from V2XSimDet "
+                    "Unexpected batch structure; expected 12 fields from V2XSimDet "
                     f"but got {len(batch_fields)}."
                 )
 
@@ -507,12 +494,8 @@ def main():
             target_agent_id_list = list(target_agent_id_list)
             num_agent_list = list(num_agent_list)
             trans_matrices_list = list(trans_matrices_list)
-            if raw_lidar_list is not None:
-                raw_lidar_list = list(raw_lidar_list)
 
             # --- policy: logits -> probs -> Bernoulli sample ---
-            # Selector runs *before* any BEV feature extraction so that only the
-            # chosen agents incur voxelization/fusion cost.
             selected_indices, actions, log_probs, probs = run_selection_policy(
                 state_feats, selector
             )
@@ -521,13 +504,12 @@ def main():
             det_loss_value = None
             metric_roi = 0.0
             if num_selected > 0:
-                # --- filter detection inputs according to selected agents (pre-BEV if raw lidar is available) ---
-                raw_pc_sel = [raw_lidar_list[i] for i in selected_indices] if raw_lidar_list else None
-                bev_sel = [padded_voxel_point_list[i] for i in selected_indices] if raw_pc_sel is None else None
+                # --- filter detection inputs according to selected agents ---
+                bev_sel = [padded_voxel_point_list[i] for i in selected_indices]
 
                 data, num_agents = assemble_detection_inputs(
                     selected_indices=selected_indices,
-                    raw_point_clouds=raw_pc_sel,
+                    raw_point_clouds=None,
                     precomputed_bevs=bev_sel,
                     labels=label_one_hot_list,
                     reg_targets=reg_target_list,
