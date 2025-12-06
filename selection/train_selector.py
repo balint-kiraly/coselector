@@ -226,30 +226,15 @@ def compute_roi_bounds_from_rsu(
     )
 
 
-def run_selection_strategy(state_feats, selector, strategy: str, topk: int):
-    """Dispatch to the requested selector strategy before BEV construction."""
+def run_selection_policy(state_feats, selector):
+    """
+    Sample Bernoulli keep/drop decisions for each agent before BEV construction.
 
-    num_agents = state_feats.shape[0]
+    The selector is always trained (no eval/testing-only strategies), so this
+    function simply runs the learned policy and returns the sampled mask plus
+    log-probabilities for REINFORCE.
+    """
 
-    if strategy == "identity":
-        # Keep everyone; no gradient contribution.
-        actions = torch.ones((num_agents,), device=state_feats.device)
-        log_probs = torch.zeros_like(actions)
-        return list(range(num_agents)), actions, log_probs, torch.ones_like(actions)
-
-    if strategy == "topk":
-        k = min(topk, num_agents)
-        # Assume the first two columns of the state features encode planar position.
-        distances = torch.norm(state_feats[:, :2], dim=1)
-        _, idx = torch.topk(distances, k=k, largest=False)
-        actions = torch.zeros((num_agents,), device=state_feats.device)
-        actions[idx] = 1.0
-        log_probs = torch.zeros_like(actions)
-        probs = torch.zeros_like(actions)
-        probs[idx] = 1.0
-        return idx.cpu().tolist(), actions, log_probs, probs
-
-    # Learned RL policy
     logits = selector(state_feats)  # (N,)
     probs = torch.sigmoid(logits)
     distribution = torch.distributions.Bernoulli(probs)
@@ -277,30 +262,6 @@ def parse_args():
     p.add_argument("--ckpt", type=str, required=True,
                    help="Detection model checkpoint to load.")
     p.add_argument("--num_workers", type=int, default=1)
-
-    # selector control / modes
-    p.add_argument(
-        "--mode",
-        choices=["train", "eval"],
-        default="train",
-        help="Whether to update the selector (train) or just log selections (eval).",
-    )
-    p.add_argument(
-        "--selector_strategy",
-        choices=["learned", "identity", "topk"],
-        default="learned",
-        help=(
-            "Selector to run before BEV extraction: RL policy (learned), "
-            "identity (keep all), or topk (nearest agents by distance feature)."
-        ),
-    )
-    p.add_argument(
-        "--selector_topk",
-        type=int,
-        default=3,
-        help="K for the top-k selector strategy (used only when selector_strategy=topk).",
-    )
-
 
     # RL selector
     p.add_argument("--selector_hidden_dim", type=int, default=64)
@@ -552,8 +513,8 @@ def main():
             # --- policy: logits -> probs -> Bernoulli sample ---
             # Selector runs *before* any BEV feature extraction so that only the
             # chosen agents incur voxelization/fusion cost.
-            selected_indices, actions, log_probs, probs = run_selection_strategy(
-                state_feats, selector, args.selector_strategy, args.selector_topk
+            selected_indices, actions, log_probs, probs = run_selection_policy(
+                state_feats, selector
             )
             num_selected = len(selected_indices)
             selected_agent_ids = [available_agent_ids[i] for i in selected_indices]
@@ -609,12 +570,9 @@ def main():
                 # no agents selected
                 reward_value = -10000.0
 
-            # update baseline only when learning
-            if args.selector_strategy == "learned":
-                baseline = beta * baseline + (1.0 - beta) * reward_value
-                advantage = reward_value - baseline
-            else:
-                advantage = reward_value
+            # update baseline for REINFORCE
+            baseline = beta * baseline + (1.0 - beta) * reward_value
+            advantage = reward_value - baseline
 
             # --- RL loss (frame-level REINFORCE) ---
             # sum log_probs over all agents in this frame
@@ -624,10 +582,9 @@ def main():
 
             loss_value = float(loss.item())
 
-            if args.mode == "train" and args.selector_strategy == "learned":
-                selector_optimizer.zero_grad()
-                loss.backward()
-                selector_optimizer.step()
+            selector_optimizer.zero_grad()
+            loss.backward()
+            selector_optimizer.step()
 
             # frame-level logging
             loss_history.append(loss_value)
@@ -649,8 +606,6 @@ def main():
                     "roi_metric_f1": metric_roi,
                     "actions": actions.detach().cpu().int().tolist(),
                     "probs": probs.detach().cpu().tolist(),
-                    "selector_strategy": args.selector_strategy,
-                    "mode": args.mode,
                 }
             )
             frame_counter += 1
