@@ -22,6 +22,7 @@ from coperception.utils.data_util import apply_pose_noise
 
 from data_utils.build_state_features import build_state_features
 from data_utils.state_index import StateIndex
+from selection.bev_builder import assemble_detection_inputs
 from selection.models import AgentSelectorMLP
 from selection.policy import select_agents_from_metadata, SelectionMethod
 
@@ -292,12 +293,29 @@ def main(args):
         num_agent_list = _sel(num_agent_list)
         trans_matrices_list = _sel(trans_matrices_list)
 
-        selected_num_agents = len(selected_indices)
+        # Fuse the selected agents after policy decisions so detector inputs follow
+        # the create_data_det alignment/voxelization used during data prep.
+        data = assemble_detection_inputs(
+            config,
+            padded_voxel_point_list,
+            padded_voxel_points_teacher_list,
+            label_one_hot_list,
+            reg_target_list,
+            reg_loss_mask_list,
+            anchors_map_list,
+            vis_maps_list,
+            target_agent_id_list,
+            num_agent_list,
+            trans_matrices_list,
+            device,
+        )
 
-        trans_matrices = torch.stack(tuple(trans_matrices_list), 1)
-        target_agent_ids = torch.stack(tuple(target_agent_id_list), 1)
-        num_all_agents = torch.stack(tuple(num_agent_list), 1)
-        num_all_agents[:] = selected_num_agents
+        trans_matrices = data["trans_matrices"]
+        num_all_agents = data["num_agent"]
+        padded_voxel_points = data["bev_seq"]
+        label_one_hot = data["labels"]
+        reg_target = data["reg_targets"]
+        anchors_map = data["anchors"]
 
         # add pose noise
         if pose_noise > 0:
@@ -305,29 +323,7 @@ def main(args):
 
         if not args.rsu:
             num_all_agents -= 1
-
-        if flag == "upperbound":
-            padded_voxel_points = torch.cat(tuple(padded_voxel_points_teacher_list), 0)
-        else:
-            padded_voxel_points = torch.cat(tuple(padded_voxel_point_list), 0)
-
-        label_one_hot = torch.cat(tuple(label_one_hot_list), 0)
-        reg_target = torch.cat(tuple(reg_target_list), 0)
-        reg_loss_mask = torch.cat(tuple(reg_loss_mask_list), 0)
-        anchors_map = torch.cat(tuple(anchors_map_list), 0)
-        vis_maps = torch.cat(tuple(vis_maps_list), 0)
-
-        data = {
-            "bev_seq": padded_voxel_points.to(device),
-            "labels": label_one_hot.to(device),
-            "reg_targets": reg_target.to(device),
-            "anchors": anchors_map.to(device),
-            "vis_maps": vis_maps.to(device),
-            "reg_loss_mask": reg_loss_mask.to(device).type(dtype=torch.bool),
-            "target_agent_ids": target_agent_ids.to(device),
-            "num_agent": num_all_agents.to(device),
-            "trans_matrices": trans_matrices.to(device),
-        }
+        data["num_agent"] = num_all_agents
 
         if flag == "lowerbound_box_com":
             loss, cls_loss, loc_loss, result = fafmodule.predict_all_with_box_com(

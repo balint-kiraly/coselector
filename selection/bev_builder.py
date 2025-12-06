@@ -1,0 +1,214 @@
+import torch
+import torch.nn.functional as F
+from typing import List, Sequence
+
+
+def _get_voxel_params(config):
+    voxel_size = getattr(config, "voxel_size", None)
+    area_extents = getattr(config, "area_extents", None)
+    if voxel_size is None:
+        voxel_size = [0.4, 0.4, 0.4]
+    if area_extents is None:
+        area_extents = [[-140.8, 140.8], [-40.0, 40.0], [-3.0, 1.0]]
+    return torch.tensor(voxel_size, dtype=torch.float32), torch.tensor(
+        area_extents, dtype=torch.float32
+    )
+
+
+def _match_template_shape(bev: torch.Tensor, template_shape: torch.Size) -> torch.Tensor:
+    """Reshape or expand the BEV to match the expected detector template shape."""
+    if bev.dim() == 4:
+        bev = bev.unsqueeze(0)
+    if bev.dim() == 5 and bev.shape[1] == 1 and template_shape[1] > 1:
+        bev = bev.repeat(1, template_shape[1], 1, 1, 1)
+    if bev.shape[2] < template_shape[2]:
+        pad_channels = template_shape[2] - bev.shape[2]
+        padding = torch.zeros(
+            bev.shape[0], bev.shape[1], pad_channels, bev.shape[3], bev.shape[4], device=bev.device
+        )
+        bev = torch.cat([bev, padding], dim=2)
+    elif bev.shape[2] > template_shape[2]:
+        bev = bev[:, :, : template_shape[2]]
+    if bev.shape[-2:] != template_shape[-2:]:
+        h_pad = max(0, template_shape[-2] - bev.shape[-2])
+        w_pad = max(0, template_shape[-1] - bev.shape[-1])
+        if h_pad or w_pad:
+            bev = F.pad(bev, (0, w_pad, 0, h_pad))
+        bev = bev[:, :, :, : template_shape[-2], : template_shape[-1]]
+    return bev
+
+
+def _voxelize_points(point_clouds: List[torch.Tensor], trans_matrices: List[torch.Tensor], config, template: torch.Tensor) -> torch.Tensor:
+    """Fuse raw point clouds by warping them into the ego frame then voxelizing."""
+    voxel_size, area_extents = _get_voxel_params(config)
+    device = template.device
+    fused_points: List[torch.Tensor] = []
+    for pts, trans in zip(point_clouds, trans_matrices):
+        if pts is None:
+            continue
+        pts_t = torch.as_tensor(pts, device=device, dtype=torch.float32)
+        if pts_t.numel() == 0:
+            continue
+        if pts_t.dim() > 2:
+            pts_t = pts_t.view(-1, pts_t.shape[-1])
+        if pts_t.shape[-1] < 3:
+            continue
+        trans_t = torch.as_tensor(trans, device=device, dtype=torch.float32)
+        while trans_t.dim() > 2:
+            trans_t = trans_t[0]
+        homo = torch.cat([pts_t[:, :3], torch.ones((pts_t.shape[0], 1), device=device)], dim=1).t()
+        pts_ego = (trans_t @ homo).t()
+        intensity = pts_t[:, 3:4] if pts_t.shape[1] > 3 else torch.ones((pts_t.shape[0], 1), device=device)
+        fused_points.append(torch.cat([pts_ego[:, :3], intensity], dim=1))
+
+    if not fused_points:
+        return template
+
+    fused_points = torch.cat(fused_points, dim=0)
+
+    try:
+        from coperception.utils.data_util import voxelize_occupy
+
+        bev = voxelize_occupy(
+            fused_points.detach().cpu().numpy(),
+            voxel_size.detach().cpu().numpy(),
+            area_extents.detach().cpu().numpy(),
+        )
+        bev_tensor = torch.from_numpy(bev).to(device=device, dtype=torch.float32)
+        if bev_tensor.dim() == 3:
+            bev_tensor = bev_tensor.permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+        return _match_template_shape(bev_tensor, template.shape)
+    except Exception:
+        lower_bound = area_extents[:, 0].to(device)
+        upper_bound = area_extents[:, 1].to(device)
+        mask = (fused_points[:, :3] >= lower_bound) & (fused_points[:, :3] < upper_bound)
+        mask = mask.all(dim=1)
+        fused_points = fused_points[mask]
+        if fused_points.numel() == 0:
+            return template
+        idx = ((fused_points[:, :3] - lower_bound) / voxel_size.to(device)).long()
+        z_bins = int((upper_bound[2] - lower_bound[2]) / voxel_size[2])
+        y_bins = int((upper_bound[1] - lower_bound[1]) / voxel_size[1])
+        x_bins = int((upper_bound[0] - lower_bound[0]) / voxel_size[0])
+        bev_tensor = torch.zeros((1, 1, z_bins, y_bins, x_bins), device=device)
+        bev_tensor[0, 0, idx[:, 2], idx[:, 1], idx[:, 0]] = 1.0
+        bev_tensor = bev_tensor.max(dim=2, keepdim=True).values
+        return _match_template_shape(bev_tensor, template.shape)
+
+
+def _compute_affine(trans: torch.Tensor, voxel_size: torch.Tensor, area_extents: torch.Tensor, device) -> torch.Tensor:
+    trans_t = torch.as_tensor(trans, device=device, dtype=torch.float32)
+    while trans_t.dim() > 2:
+        trans_t = trans_t[0]
+    theta = torch.zeros((1, 2, 3), device=device)
+    theta[:, :, :2] = trans_t[:2, :2]
+    x_range = area_extents[0, 1] - area_extents[0, 0]
+    y_range = area_extents[1, 1] - area_extents[1, 0]
+    theta[:, 0, 2] = 2.0 * trans_t[0, 3] / x_range
+    theta[:, 1, 2] = 2.0 * trans_t[1, 3] / y_range
+    return theta
+
+
+def _warp_and_merge_bevs(bev_list: Sequence[torch.Tensor], trans_matrices: List[torch.Tensor], config, template: torch.Tensor) -> torch.Tensor:
+    voxel_size, area_extents = _get_voxel_params(config)
+    device = template.device
+    merged = None
+    template_shape = template.shape
+    for bev, trans in zip(bev_list, trans_matrices):
+        if bev is None:
+            continue
+        bev_t = torch.as_tensor(bev, device=device, dtype=torch.float32)
+        if bev_t.dim() == 5:
+            b, t, c, h, w = bev_t.shape
+            bev_t = bev_t.view(b, t * c, h, w)
+        elif bev_t.dim() == 4:
+            pass
+        else:
+            continue
+        theta = _compute_affine(trans, voxel_size, area_extents, device)
+        grid = F.affine_grid(theta, bev_t.shape, align_corners=False)
+        warped = F.grid_sample(bev_t, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        if merged is None:
+            merged = warped
+        else:
+            merged = merged + warped
+    if merged is None:
+        return template
+    merged = merged.unsqueeze(1) if merged.dim() == 4 else merged
+    merged = merged.view(template_shape[0], template_shape[1], -1, template_shape[3], template_shape[4])
+    return _match_template_shape(merged, template_shape)
+
+
+def assemble_detection_inputs(
+    config,
+    padded_voxel_point_list: Sequence[torch.Tensor],
+    padded_voxel_points_teacher_list: Sequence[torch.Tensor],
+    label_one_hot_list: Sequence[torch.Tensor],
+    reg_target_list: Sequence[torch.Tensor],
+    reg_loss_mask_list: Sequence[torch.Tensor],
+    anchors_map_list: Sequence[torch.Tensor],
+    vis_maps_list: Sequence[torch.Tensor],
+    target_agent_id_list: Sequence[torch.Tensor],
+    num_agent_list: Sequence[torch.Tensor],
+    trans_matrices_list: Sequence[torch.Tensor],
+    device: torch.device,
+):
+    """
+    Assemble detector inputs after agent selection by fusing selected agents' BEVs.
+
+    The fusion follows the same alignment/voxelization strategy used by the
+    detection data builder (``create_data_det``): selected agents' raw lidar
+    points are first transformed into the reference (ego/RSU) frame via the
+    provided transformation matrices, merged, and voxelized. When only
+    precomputed BEVs are available, they are warped into the ego frame using the
+    same transform parameters before being combined. The resulting fused BEV
+    tensor replaces the simple per-agent stack so that detector inputs reflect
+    only the chosen agents' data.
+    """
+
+    trans_matrices = torch.stack(tuple(trans_matrices_list), 1).to(device)
+    target_agent_ids = torch.stack(tuple(target_agent_id_list), 1).to(device)
+    if num_agent_list:
+        num_all_agents = torch.stack(tuple(num_agent_list), 1).to(device)
+    else:
+        num_all_agents = torch.zeros((1, 1), dtype=torch.int64, device=device)
+    num_selected = len(trans_matrices_list)
+    if num_all_agents.numel():
+        num_all_agents[:] = num_selected
+
+    template_bev = padded_voxel_points_teacher_list[0].to(device)
+    use_raw_points = bool(padded_voxel_point_list) and padded_voxel_point_list[0] is not None and padded_voxel_point_list[0].dim() <= 3
+
+    if use_raw_points:
+        fused_bev = _voxelize_points(
+            list(padded_voxel_point_list), list(trans_matrices_list), config, template_bev
+        ).to(device)
+    else:
+        fused_bev = _warp_and_merge_bevs(
+            list(padded_voxel_points_teacher_list), list(trans_matrices_list), config, template_bev
+        ).to(device)
+
+    if fused_bev.dim() == 4:
+        fused_bev = fused_bev.unsqueeze(0)
+    if num_selected > 1:
+        fused_bev = fused_bev.repeat(num_selected, 1, 1, 1, 1)
+
+    label_one_hot = torch.cat(tuple(label_one_hot_list), 0).to(device)
+    reg_target = torch.cat(tuple(reg_target_list), 0).to(device)
+    reg_loss_mask = torch.cat(tuple(reg_loss_mask_list), 0).to(device)
+    anchors_map = torch.cat(tuple(anchors_map_list), 0).to(device)
+    vis_maps = torch.cat(tuple(vis_maps_list), 0).to(device)
+
+    data = {
+        "bev_seq": fused_bev,
+        "labels": label_one_hot,
+        "reg_targets": reg_target,
+        "anchors": anchors_map,
+        "vis_maps": vis_maps,
+        "reg_loss_mask": reg_loss_mask.bool(),
+        "target_agent_ids": target_agent_ids,
+        "num_agent": num_all_agents,
+        "trans_matrices": trans_matrices,
+    }
+
+    return data
