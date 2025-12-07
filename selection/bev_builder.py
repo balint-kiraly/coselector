@@ -96,6 +96,36 @@ def _voxelize_points(point_clouds: List[torch.Tensor], trans_matrices: List[torc
         return _match_template_shape(bev_tensor, template.shape)
 
 
+def _default_template(config, device: torch.device, anchors_map_list: Sequence[torch.Tensor]):
+    """Return a zero BEV matching config voxel extents when no template exists."""
+
+    voxel_size, area_extents = _get_voxel_params(config)
+    x_bins = int((area_extents[0, 1] - area_extents[0, 0]) / voxel_size[0])
+    y_bins = int((area_extents[1, 1] - area_extents[1, 0]) / voxel_size[1])
+    template = torch.zeros((1, 1, 1, y_bins, x_bins), device=device, dtype=torch.float32)
+
+    # If we have anchors, try to align spatial dimensions to them while keeping
+    # a single BEV channel, so downstream shapes stay consistent.
+    for anchors in anchors_map_list:
+        if anchors is None:
+            continue
+        anchors_t = torch.as_tensor(anchors, device=device)
+        if anchors_t.numel() == 0 or anchors_t.dim() < 2:
+            continue
+        h, w = anchors_t.shape[-2], anchors_t.shape[-1]
+        if h and w:
+            template = template[..., :h, :w]
+        break
+
+    return template
+
+def _ensure_bev_channels_first(bev: torch.Tensor) -> torch.Tensor:
+    """Convert BEV tensor to (B, T, C, H, W) if it is channel-last."""
+
+    if bev.dim() == 5 and bev.shape[2] > bev.shape[4] and bev.shape[3] > bev.shape[4]:
+        bev = bev.permute(0, 1, 4, 2, 3)
+    return bev
+
 def _compute_affine(trans: torch.Tensor, voxel_size: torch.Tensor, area_extents: torch.Tensor, device) -> torch.Tensor:
     trans_t = torch.as_tensor(trans, device=device, dtype=torch.float32)
     while trans_t.dim() > 2:
@@ -118,6 +148,7 @@ def _warp_and_merge_bevs(bev_list: Sequence[torch.Tensor], trans_matrices: List[
         if bev is None:
             continue
         bev_t = torch.as_tensor(bev, device=device, dtype=torch.float32)
+        bev_t = _ensure_bev_channels_first(bev_t)
         if bev_t.dim() == 5:
             b, t, c, h, w = bev_t.shape
             bev_t = bev_t.view(b, t * c, h, w)
@@ -140,18 +171,18 @@ def _warp_and_merge_bevs(bev_list: Sequence[torch.Tensor], trans_matrices: List[
 
 
 def assemble_detection_inputs(
-    config,
-    padded_voxel_point_list: Sequence[torch.Tensor],
-    padded_voxel_points_teacher_list: Sequence[torch.Tensor],
-    label_one_hot_list: Sequence[torch.Tensor],
-    reg_target_list: Sequence[torch.Tensor],
-    reg_loss_mask_list: Sequence[torch.Tensor],
-    anchors_map_list: Sequence[torch.Tensor],
-    vis_maps_list: Sequence[torch.Tensor],
-    target_agent_id_list: Sequence[torch.Tensor],
-    num_agent_list: Sequence[torch.Tensor],
-    trans_matrices_list: Sequence[torch.Tensor],
-    device: torch.device,
+        config,
+        padded_voxel_point_list: Sequence[torch.Tensor],
+        padded_voxel_points_teacher_list: Sequence[torch.Tensor],
+        label_one_hot_list: Sequence[torch.Tensor],
+        reg_target_list: Sequence[torch.Tensor],
+        reg_loss_mask_list: Sequence[torch.Tensor],
+        anchors_map_list: Sequence[torch.Tensor],
+        vis_maps_list: Sequence[torch.Tensor],
+        target_agent_id_list: Sequence[torch.Tensor],
+        num_agent_list: Sequence[torch.Tensor],
+        trans_matrices_list: Sequence[torch.Tensor],
+        device: torch.device,
 ):
     """
     Assemble detector inputs after agent selection by fusing selected agents' BEVs.
@@ -176,22 +207,50 @@ def assemble_detection_inputs(
     if num_all_agents.numel():
         num_all_agents[:] = num_selected
 
-    template_bev = padded_voxel_points_teacher_list[0].to(device)
-    use_raw_points = bool(padded_voxel_point_list) and padded_voxel_point_list[0] is not None and padded_voxel_point_list[0].dim() <= 3
+    def _first_nonempty(tensors: Sequence[torch.Tensor]):
+        for cand in tensors:
+            if cand is None:
+                continue
+            cand_t = torch.as_tensor(cand, device=device, dtype=torch.float32)
+            if cand_t.numel() == 0:
+                continue
+            return cand_t
+        return None
 
-    if use_raw_points:
+    template_bev = _first_nonempty(padded_voxel_points_teacher_list)
+    if template_bev is None:
+        template_bev = _first_nonempty(padded_voxel_point_list)
+    else:
+        template_bev = _ensure_bev_channels_first(template_bev)
+        if template_bev.dim() == 4:
+            template_bev = template_bev.unsqueeze(0)
+
+    has_raw_point_clouds = bool(padded_voxel_point_list) and padded_voxel_point_list[0] != [] and padded_voxel_point_list[0].dim() <= 3
+    has_teacher_bevs = bool(padded_voxel_points_teacher_list) and padded_voxel_points_teacher_list[0] != [] and torch.as_tensor(padded_voxel_points_teacher_list[0]).numel() > 0
+    has_bev_points = bool(padded_voxel_point_list) and padded_voxel_point_list[0] != [] and padded_voxel_point_list[0].dim() >= 4
+
+    if has_raw_point_clouds:
         fused_bev = _voxelize_points(
             list(padded_voxel_point_list), list(trans_matrices_list), config, template_bev
         ).to(device)
-    else:
+    elif has_teacher_bevs:
         fused_bev = _warp_and_merge_bevs(
             list(padded_voxel_points_teacher_list), list(trans_matrices_list), config, template_bev
         ).to(device)
+    elif has_bev_points:
+        bev_points_cf = [_ensure_bev_channels_first(torch.as_tensor(b, device=device, dtype=torch.float32)) if b is not None else None for b in padded_voxel_point_list]
+        fused_bev = _warp_and_merge_bevs(
+            bev_points_cf, list(trans_matrices_list), config, template_bev
+        ).to(device)
+    else:
+        fused_bev = template_bev.to(device)
 
     if fused_bev.dim() == 4:
         fused_bev = fused_bev.unsqueeze(0)
     if num_selected > 1:
         fused_bev = fused_bev.repeat(num_selected, 1, 1, 1, 1)
+
+    fused_bev = fused_bev.permute(0, 1, 3, 4, 2)
 
     label_one_hot = torch.cat(tuple(label_one_hot_list), 0).to(device)
     reg_target = torch.cat(tuple(reg_target_list), 0).to(device)
