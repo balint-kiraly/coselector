@@ -96,7 +96,11 @@ def main(args):
     if not args.rsu:
         num_agent -= 1
 
-    if flag == "upperbound" or flag.startswith("lowerbound"):
+    if args.selection:
+        model = FaFNet(
+            config, layer=args.layer, kd_flag=0, num_agent=1
+        )
+    elif flag == "upperbound" or flag.startswith("lowerbound"):
         model = FaFNet(
             config, layer=args.layer, kd_flag=args.kd_flag, num_agent=num_agent
         )
@@ -248,86 +252,122 @@ def main(args):
 
         filename0 = filenames[0][0][0]
 
-        # --------------------------------------------------
-        # Agent selection: build state features, run policy
-        # --------------------------------------------------
-
         parts = filename0.split(os.sep)
         scene_frame = parts[-2]  # e.g. "12_5"
         scene_id, frame_id = map(int, scene_frame.split("_"))
 
-        state_feats = build_state_features(
-            state_index=state_index,
-            scene_id=scene_id,
-            frame_id=frame_id,
-        )
-        state_feats = state_feats.to(device)
+        if scene_id < args.scene_begin or scene_id >= args.scene_end:
+            print(f"Skipping scene {scene_id} as it is outside the range [{args.scene_begin}, {args.scene_end})")
+            continue
 
-        # ------------------ Agent Selection Model ------------------
-        if cnt == 0 and args.sel_method == "ml_model":
-            sel_model = AgentSelectorMLP(input_dim=state_feats.shape[1])
-            sel_model = sel_model.to(device)
-            #sel_model = nn.DataParallel(sel_model)
-            assert args.sel_model_path is not None, "Path to trained agent selection model is not provided"
-            sel_model.load_state_dict(torch.load(args.sel_model_path))
-            sel_model.eval()
-            print(f"Loaded agent selection model from {args.sel_model_path}")
+        if args.selection:
+            # --------------------------------------------------
+            # Agent selection: build state features, run policy
+            # --------------------------------------------------
 
-        selected_indices = select_agents_from_metadata(
-            state_feats,
-            method=SelectionMethod(args.sel_method),
-            model=sel_model,
-        )
+            state_feats = build_state_features(
+                state_index=state_index,
+                scene_id=scene_id,
+                frame_id=frame_id,
+            )
+            state_feats = state_feats.to(device)
 
-        selected_num_agents = len(selected_indices)
+            # ------------------ Agent Selection Model ------------------
+            if args.selection and args.sel_method == "ml_model" and cnt == 0:
+                sel_model = AgentSelectorMLP(input_dim=state_feats.shape[1])
+                sel_model = sel_model.to(device)
+                #sel_model = nn.DataParallel(sel_model)
+                assert args.sel_model_path is not None, "Path to trained agent selection model is not provided"
+                sel_model.load_state_dict(torch.load(args.sel_model_path))
+                sel_model.eval()
+                print(f"Loaded agent selection model from {args.sel_model_path}")
 
-        def _sel(lst):
-            return [lst[i] for i in selected_indices]
+            selected_indices = select_agents_from_metadata(
+                state_feats,
+                method=SelectionMethod(args.sel_method),
+                model=sel_model,
+            )
 
-        padded_voxel_point_list = _sel(padded_voxel_point_list)
-        padded_voxel_points_teacher_list = _sel(padded_voxel_points_teacher_list)
-        label_one_hot_list = _sel(label_one_hot_list)
-        reg_target_list = _sel(reg_target_list)
-        reg_loss_mask_list = _sel(reg_loss_mask_list)
-        anchors_map_list = _sel(anchors_map_list)
-        vis_maps_list = _sel(vis_maps_list)
-        target_agent_id_list = _sel(target_agent_id_list)
-        num_agent_list = _sel(num_agent_list)
-        trans_matrices_list = _sel(trans_matrices_list)
+            selected_num_agents = len(selected_indices)
 
-        # Fuse the selected agents after policy decisions so detector inputs follow
-        # the create_data_det alignment/voxelization used during data prep.
-        data = assemble_detection_inputs(
-            config,
-            padded_voxel_point_list,
-            padded_voxel_points_teacher_list,
-            label_one_hot_list,
-            reg_target_list,
-            reg_loss_mask_list,
-            anchors_map_list,
-            vis_maps_list,
-            target_agent_id_list,
-            num_agent_list,
-            trans_matrices_list,
-            device,
-        )
+            def _sel(lst):
+                return [lst[i] for i in selected_indices]
 
-        trans_matrices = data["trans_matrices"]
-        num_all_agents = data["num_agent"]
-        padded_voxel_points = data["bev_seq"]
-        label_one_hot = data["labels"]
-        reg_target = data["reg_targets"]
-        anchors_map = data["anchors"]
+            padded_voxel_point_list = _sel(padded_voxel_point_list)
+            padded_voxel_points_teacher_list = _sel(padded_voxel_points_teacher_list)
+            label_one_hot_list = _sel(label_one_hot_list)
+            reg_target_list = _sel(reg_target_list)
+            reg_loss_mask_list = _sel(reg_loss_mask_list)
+            anchors_map_list = _sel(anchors_map_list)
+            vis_maps_list = _sel(vis_maps_list)
+            target_agent_id_list = _sel(target_agent_id_list)
+            num_agent_list = _sel(num_agent_list)
+            trans_matrices_list = _sel(trans_matrices_list)
 
-        # add pose noise
-        if pose_noise > 0:
-            apply_pose_noise(pose_noise, trans_matrices)
+            # Fuse the selected agents after policy decisions so detector inputs follow
+            # the create_data_det alignment/voxelization used during data prep.
+            data = assemble_detection_inputs(
+                config,
+                padded_voxel_point_list,
+                padded_voxel_points_teacher_list,
+                label_one_hot_list,
+                reg_target_list,
+                reg_loss_mask_list,
+                anchors_map_list,
+                vis_maps_list,
+                target_agent_id_list,
+                num_agent_list,
+                trans_matrices_list,
+                device,
+            )
 
-        if not args.rsu:
-            num_all_agents -= 1
-        data["num_agent"] = num_all_agents
+            trans_matrices = data["trans_matrices"]
+            num_all_agents = data["num_agent"]
+            padded_voxel_points = data["bev_seq"]
+            label_one_hot = data["labels"]
+            reg_target = data["reg_targets"]
+            anchors_map = data["anchors"]
+        else:
+            filename0 = filenames[0]
+            trans_matrices = torch.stack(tuple(trans_matrices_list), 1)
+            target_agent_ids = torch.stack(tuple(target_agent_id_list), 1)
+            num_all_agents = torch.stack(tuple(num_agent_list), 1)
 
-        if flag == "lowerbound_box_com":
+            # add pose noise
+            if pose_noise > 0:
+                apply_pose_noise(pose_noise, trans_matrices)
+
+            if not args.rsu:
+                num_all_agents -= 1
+
+            if flag == "upperbound":
+                padded_voxel_points = torch.cat(tuple(padded_voxel_points_teacher_list), 0)
+            else:
+                padded_voxel_points = torch.cat(tuple(padded_voxel_point_list), 0)
+
+            label_one_hot = torch.cat(tuple(label_one_hot_list), 0)
+            reg_target = torch.cat(tuple(reg_target_list), 0)
+            reg_loss_mask = torch.cat(tuple(reg_loss_mask_list), 0)
+            anchors_map = torch.cat(tuple(anchors_map_list), 0)
+            vis_maps = torch.cat(tuple(vis_maps_list), 0)
+
+            data = {
+                "bev_seq": padded_voxel_points.to(device),
+                "labels": label_one_hot.to(device),
+                "reg_targets": reg_target.to(device),
+                "anchors": anchors_map.to(device),
+                "vis_maps": vis_maps.to(device),
+                "reg_loss_mask": reg_loss_mask.to(device).type(dtype=torch.bool),
+                "target_agent_ids": target_agent_ids.to(device),
+                "num_agent": num_all_agents.to(device),
+                "trans_matrices": trans_matrices.to(device),
+            }
+
+        if args.selection:
+            loss, cls_loss, loc_loss, result = fafmodule.predict_all(
+                data, 1, num_agent=1
+            )
+        elif flag == "lowerbound_box_com":
             loss, cls_loss, loc_loss, result = fafmodule.predict_all_with_box_com(
                 data, data["trans_matrices"]
             )
@@ -338,16 +378,18 @@ def main(args):
                 loc_loss,
                 result,
                 save_agent_weight_list,
-            ) = fafmodule.predict_all(data, 1, num_agent=selected_num_agents)
+            ) = fafmodule.predict_all(data, 1, num_agent=num_agent)
         else:
             loss, cls_loss, loc_loss, result = fafmodule.predict_all(
-                data, 1, num_agent=selected_num_agents
+                data, 1, num_agent=num_agent
             )
 
         box_color_map = ["red", "yellow", "blue", "purple", "black", "orange"]
 
         # If has RSU, do not count RSU's output into evaluation
         eval_start_idx = 1 if args.rsu else 0
+        if args.selection:
+            num_agent = 1
 
         # local qualitative evaluation
         for k in range(eval_start_idx, num_agent):
@@ -663,6 +705,11 @@ if __name__ == "__main__":
         default=100,
         type=int,
         help="The end index of scenes to be evaluated",
+    )
+    parser.add_argument(
+        "--selection",
+        action="store_true",
+        help="Whether to perform agent selection",
     )
     parser.add_argument(
         "--sel_method",
