@@ -170,6 +170,70 @@ def _warp_and_merge_bevs(bev_list: Sequence[torch.Tensor], trans_matrices: List[
     return _match_template_shape(merged, template_shape)
 
 
+def _merge_spatial_tensors_max(tensors: Sequence[torch.Tensor], device, dtype=torch.float32):
+    """Merge a list of spatial tensors with a max-reduction, skipping empties."""
+    merged = None
+    for t in tensors:
+        if t is None:
+            continue
+        t_t = torch.as_tensor(t, device=device, dtype=dtype)
+        if t_t.numel() == 0:
+            continue
+        merged = t_t if merged is None else torch.max(merged, t_t)
+    return merged
+
+
+def _merge_regression_targets(reg_targets: Sequence[torch.Tensor], reg_masks: Sequence[torch.Tensor], device):
+    """Merge regression targets using the first available target per location."""
+    targets_t = []
+    masks_t = []
+    def _squeeze_leading_ones(t: torch.Tensor, max_dim: int):
+        while t.dim() > max_dim and t.shape[0] == 1:
+            t = t.squeeze(0)
+        return t
+
+    for tgt, msk in zip(reg_targets, reg_masks):
+        if tgt is None or msk is None:
+            continue
+        tgt_t = _squeeze_leading_ones(torch.as_tensor(tgt, device=device, dtype=torch.float32), 5)
+        msk_t = _squeeze_leading_ones(torch.as_tensor(msk, device=device), 5)
+        if tgt_t.numel() == 0 or msk_t.numel() == 0:
+            continue
+        targets_t.append(tgt_t)
+        masks_t.append(msk_t.bool())
+    if not targets_t:
+        return None, None
+
+    merged_mask = torch.zeros_like(masks_t[0], dtype=torch.bool, device=device)
+    merged_target = torch.zeros_like(targets_t[0], device=device, dtype=torch.float32)
+
+    for tgt, msk in zip(targets_t, masks_t):
+        # Ensure mask broadcasts over the regression code dimension.
+        msk_b = msk
+        while msk_b.dim() < tgt.dim():
+            msk_b = msk_b.unsqueeze(-1)
+        merged_target = torch.where(msk_b, tgt, merged_target)
+        merged_mask = merged_mask | msk
+
+    return merged_target, merged_mask
+
+
+def _normalize_anchor_map(anchor, device):
+    """Ensure anchor map is (H, W, num_anchors, box_code) without extra singleton dims."""
+    if anchor is None:
+        return None
+    a = torch.as_tensor(anchor, device=device, dtype=torch.float32)
+    # drop leading batch/time dims of size 1
+    while a.dim() > 4 and a.shape[0] == 1:
+        a = a.squeeze(0)
+    if a.dim() > 4 and a.shape[0] != 1 and a.shape[1] == 1:
+        a = a.squeeze(1)
+    # drop pred_len dim if present
+    if a.dim() > 4 and a.shape[-2] == 1:
+        a = a.squeeze(-2)
+    return a
+
+
 def assemble_detection_inputs(
         config,
         padded_voxel_point_list: Sequence[torch.Tensor],
@@ -197,15 +261,7 @@ def assemble_detection_inputs(
     only the chosen agents' data.
     """
 
-    trans_matrices = torch.stack(tuple(trans_matrices_list), 1).to(device)
-    target_agent_ids = torch.stack(tuple(target_agent_id_list), 1).to(device)
-    if num_agent_list:
-        num_all_agents = torch.stack(tuple(num_agent_list), 1).to(device)
-    else:
-        num_all_agents = torch.zeros((1, 1), dtype=torch.int64, device=device)
     num_selected = len(trans_matrices_list)
-    if num_all_agents.numel():
-        num_all_agents[:] = num_selected
 
     def _first_nonempty(tensors: Sequence[torch.Tensor]):
         for cand in tensors:
@@ -217,9 +273,13 @@ def assemble_detection_inputs(
             return cand_t
         return None
 
+    anchors_map_list_norm = [_normalize_anchor_map(a, device) for a in anchors_map_list]
+
     template_bev = _first_nonempty(padded_voxel_points_teacher_list)
     if template_bev is None:
         template_bev = _first_nonempty(padded_voxel_point_list)
+    if template_bev is None:
+        template_bev = _default_template(config, device, anchors_map_list_norm)
     else:
         template_bev = _ensure_bev_channels_first(template_bev)
         if template_bev.dim() == 4:
@@ -247,24 +307,62 @@ def assemble_detection_inputs(
 
     if fused_bev.dim() == 4:
         fused_bev = fused_bev.unsqueeze(0)
-    if num_selected > 1:
-        fused_bev = fused_bev.repeat(num_selected, 1, 1, 1, 1)
 
-    fused_bev = fused_bev.permute(0, 1, 3, 4, 2)
+    fused_bev = fused_bev.permute(0, 1, 3, 4, 2)  # (1, T, H, W, C)
 
-    label_one_hot = torch.cat(tuple(label_one_hot_list), 0).to(device)
-    reg_target = torch.cat(tuple(reg_target_list), 0).to(device)
-    reg_loss_mask = torch.cat(tuple(reg_loss_mask_list), 0).to(device)
-    anchors_map = torch.cat(tuple(anchors_map_list), 0).to(device)
-    vis_maps = torch.cat(tuple(vis_maps_list), 0).to(device)
+    merged_labels = _merge_spatial_tensors_max(label_one_hot_list, device)
+    merged_anchors = _merge_spatial_tensors_max(anchors_map_list_norm, device)
+    merged_vis_maps = _merge_spatial_tensors_max(vis_maps_list, device)
+    merged_reg_target, merged_reg_mask = _merge_regression_targets(reg_target_list, reg_loss_mask_list, device)
+
+    label_shape_ref = _first_nonempty(label_one_hot_list)
+    reg_target_ref = _first_nonempty(reg_target_list)
+    reg_mask_ref = _first_nonempty(reg_loss_mask_list)
+    anchor_ref = _first_nonempty(anchors_map_list_norm)
+    vis_ref = _first_nonempty(vis_maps_list)
+
+    if merged_labels is None:
+        merged_labels = torch.zeros((1, *label_shape_ref.shape), device=device) if label_shape_ref is not None else torch.zeros((1,), device=device)
+    else:
+        merged_labels = merged_labels.unsqueeze(0)
+
+    if merged_reg_target is None:
+        if reg_target_ref is not None and reg_mask_ref is not None:
+            merged_reg_target = torch.zeros((*reg_target_ref.shape,), device=device)
+            merged_reg_mask = torch.zeros((*reg_mask_ref.shape,), device=device, dtype=torch.bool)
+        else:
+            merged_reg_target = torch.zeros((1,), device=device)
+            merged_reg_mask = torch.zeros((1,), device=device, dtype=torch.bool)
+    else:
+        merged_reg_mask = merged_reg_mask.bool()
+
+    # Ensure batch dimension only once: targets (B,H,W,A,pred_len,code), mask (B,H,W,A,pred_len)
+    if merged_reg_target.dim() == 5:
+        merged_reg_target = merged_reg_target.unsqueeze(0)
+    if merged_reg_mask.dim() == 4:
+        merged_reg_mask = merged_reg_mask.unsqueeze(0)
+
+    if merged_anchors is None:
+        merged_anchors = torch.zeros((1, *anchor_ref.shape), device=device) if anchor_ref is not None else torch.zeros((1,), device=device)
+    else:
+        merged_anchors = merged_anchors.unsqueeze(0)
+
+    if merged_vis_maps is None:
+        merged_vis_maps = torch.zeros((1, *vis_ref.shape), device=device) if vis_ref is not None else torch.zeros((1,), device=device)
+    else:
+        merged_vis_maps = merged_vis_maps.unsqueeze(0)
+
+    target_agent_ids = torch.tensor([[torch.as_tensor(target_agent_id_list[0]).item()]], device=device)
+    num_all_agents = torch.tensor([[num_selected]], device=device)
+    trans_matrices = torch.eye(4, device=device, dtype=torch.float32).view(1, 1, 4, 4)
 
     data = {
         "bev_seq": fused_bev,
-        "labels": label_one_hot,
-        "reg_targets": reg_target,
-        "anchors": anchors_map,
-        "vis_maps": vis_maps,
-        "reg_loss_mask": reg_loss_mask.bool(),
+        "labels": merged_labels,
+        "reg_targets": merged_reg_target,
+        "anchors": merged_anchors,
+        "vis_maps": merged_vis_maps,
+        "reg_loss_mask": merged_reg_mask,
         "target_agent_ids": target_agent_ids,
         "num_agent": num_all_agents,
         "trans_matrices": trans_matrices,
