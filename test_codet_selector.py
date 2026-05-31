@@ -205,6 +205,13 @@ def main(args):
     saver.write(args.__repr__() + "\n\n")
     saver.flush()
 
+    if not os.path.isfile(args.resume):
+        rsu_hint = "with_rsu" if args.rsu else "no_rsu"
+        raise FileNotFoundError(
+            f"Checkpoint not found: {args.resume}. "
+            f"With --rsu {args.rsu}, use a checkpoint trained for {rsu_hint}."
+        )
+
     checkpoint = torch.load(
         args.resume, map_location="cpu"
     )  # We have low GPU utilization for testing
@@ -232,6 +239,8 @@ def main(args):
     tracking_file = [set()] * num_agent
 
     sel_model = None
+    eval_start_idx = 1 if args.rsu else 0
+    frames_processed = 0
 
     for cnt, sample in enumerate(validation_data_loader):
         t = time.time()
@@ -265,12 +274,16 @@ def main(args):
             # Agent selection: build state features, run policy
             # --------------------------------------------------
 
-            state_feats = build_state_features(
+            state_feats, metas = build_state_features(
                 state_index=state_index,
                 scene_id=scene_id,
                 frame_id=frame_id,
+                return_meta=True,
             )
             state_feats = state_feats.to(device)
+            agent_id_to_idx = {
+                agent_id: idx for idx, agent_id in enumerate(agent_idx_range)
+            }
 
             # ------------------ Agent Selection Model ------------------
             if args.selection and args.sel_method == "ml_model" and cnt == 0:
@@ -282,11 +295,22 @@ def main(args):
                 sel_model.eval()
                 print(f"Loaded agent selection model from {args.sel_model_path}")
 
-            selected_indices = select_agents_from_metadata(
+            selected_state_indices = select_agents_from_metadata(
                 state_feats,
                 method=SelectionMethod(args.sel_method),
                 model=sel_model,
             )
+            selected_indices = [
+                agent_id_to_idx[metas[i].agent_id]
+                for i in selected_state_indices
+                if metas[i].agent_id in agent_id_to_idx
+            ]
+            if not selected_indices:
+                print(
+                    f"Skipping scene {scene_id} frame {frame_id}: "
+                    "no selected agents match detection dataloader indices"
+                )
+                continue
 
             selected_num_agents = len(selected_indices)
 
@@ -303,6 +327,7 @@ def main(args):
             target_agent_id_list = _sel(target_agent_id_list)
             num_agent_list = _sel(num_agent_list)
             trans_matrices_list = _sel(trans_matrices_list)
+            gt_max_iou = _sel(list(gt_max_iou))
 
             # Fuse the selected agents after policy decisions so detector inputs follow
             # the create_data_det alignment/voxelization used during data prep.
@@ -387,7 +412,8 @@ def main(args):
         box_color_map = ["red", "yellow", "blue", "purple", "black", "orange"]
 
         # If has RSU, do not count RSU's output into evaluation
-        eval_start_idx = 1 if args.rsu else 0
+        if not args.selection:
+            eval_start_idx = 1 if args.rsu else 0
         if args.selection:
             num_agent = 1
 
@@ -504,6 +530,14 @@ def main(args):
 
         print("Validation scene {}, at frame {}".format(seq_name, idx))
         print("Takes {} s\n".format(str(time.time() - t)))
+        frames_processed += 1
+
+    if frames_processed == 0:
+        raise RuntimeError(
+            "No frames were evaluated. Check --scene_begin/--scene_end against "
+            "scenes present in --data_prep (test split commonly uses scenes "
+            "such as 5, 8, and 19)."
+        )
 
     logger_root = args.logpath if args.logpath != "" else "logs"
     logger_root = os.path.join(

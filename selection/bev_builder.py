@@ -183,39 +183,74 @@ def _merge_spatial_tensors_max(tensors: Sequence[torch.Tensor], device, dtype=to
     return merged
 
 
-def _merge_regression_targets(reg_targets: Sequence[torch.Tensor], reg_masks: Sequence[torch.Tensor], device):
-    """Merge regression targets using the first available target per location."""
-    targets_t = []
-    masks_t = []
-    def _squeeze_leading_ones(t: torch.Tensor, max_dim: int):
-        while t.dim() > max_dim and t.shape[0] == 1:
-            t = t.squeeze(0)
-        return t
+def _squeeze_to_rank(t: torch.Tensor, rank: int) -> torch.Tensor:
+    """Drop leading batch dims of size 1 until ``t`` has the expected rank."""
+    while t.dim() > rank and t.shape[0] == 1:
+        t = t.squeeze(0)
+    return t
 
-    for tgt, msk in zip(reg_targets, reg_masks):
-        if tgt is None or msk is None:
-            continue
-        tgt_t = _squeeze_leading_ones(torch.as_tensor(tgt, device=device, dtype=torch.float32), 5)
-        msk_t = _squeeze_leading_ones(torch.as_tensor(msk, device=device), 5)
-        if tgt_t.numel() == 0 or msk_t.numel() == 0:
-            continue
-        targets_t.append(tgt_t)
-        masks_t.append(msk_t.bool())
-    if not targets_t:
-        return None, None
 
-    merged_mask = torch.zeros_like(masks_t[0], dtype=torch.bool, device=device)
-    merged_target = torch.zeros_like(targets_t[0], device=device, dtype=torch.float32)
+def _ensure_batch_dim(t: torch.Tensor, batched_rank: int) -> torch.Tensor:
+    """Ensure a single leading batch dimension for downstream detector code."""
+    t = _squeeze_to_rank(t, batched_rank - 1)
+    if t.dim() == batched_rank - 1:
+        t = t.unsqueeze(0)
+    return t
 
-    for tgt, msk in zip(targets_t, masks_t):
-        # Ensure mask broadcasts over the regression code dimension.
-        msk_b = msk
-        while msk_b.dim() < tgt.dim():
-            msk_b = msk_b.unsqueeze(-1)
-        merged_target = torch.where(msk_b, tgt, merged_target)
-        merged_mask = merged_mask | msk
 
-    return merged_target, merged_mask
+def _reference_supervision_tensors(
+    label_one_hot_list: Sequence[torch.Tensor],
+    reg_target_list: Sequence[torch.Tensor],
+    reg_loss_mask_list: Sequence[torch.Tensor],
+    anchors_map_list: Sequence[torch.Tensor],
+    vis_maps_list: Sequence[torch.Tensor],
+    device,
+):
+    """Use the reference (first selected) agent's supervision maps in ego frame."""
+
+    def _first_or_none(tensors):
+        for tensor in tensors:
+            if tensor is None:
+                continue
+            t = torch.as_tensor(tensor, device=device)
+            if t.numel() == 0:
+                continue
+            return tensor
+        return None
+
+    label_ref = _first_or_none(label_one_hot_list)
+    reg_target_ref = _first_or_none(reg_target_list)
+    reg_mask_ref = _first_or_none(reg_loss_mask_list)
+    anchor_ref = _first_or_none(anchors_map_list)
+    vis_ref = _first_or_none(vis_maps_list)
+
+    merged_labels = (
+        _ensure_batch_dim(torch.as_tensor(label_ref, device=device, dtype=torch.float32), 5)
+        if label_ref is not None
+        else None
+    )
+    merged_reg_target = (
+        _ensure_batch_dim(torch.as_tensor(reg_target_ref, device=device, dtype=torch.float32), 6)
+        if reg_target_ref is not None
+        else None
+    )
+    merged_reg_mask = (
+        _ensure_batch_dim(torch.as_tensor(reg_mask_ref, device=device), 5).bool()
+        if reg_mask_ref is not None
+        else None
+    )
+    merged_anchors = (
+        _ensure_batch_dim(torch.as_tensor(anchor_ref, device=device, dtype=torch.float32), 5)
+        if anchor_ref is not None
+        else None
+    )
+    merged_vis_maps = (
+        _ensure_batch_dim(torch.as_tensor(vis_ref, device=device, dtype=torch.float32), 4)
+        if vis_ref is not None
+        else None
+    )
+
+    return merged_labels, merged_reg_target, merged_reg_mask, merged_anchors, merged_vis_maps
 
 
 def _normalize_anchor_map(anchor, device):
@@ -310,10 +345,20 @@ def assemble_detection_inputs(
 
     fused_bev = fused_bev.permute(0, 1, 3, 4, 2)  # (1, T, H, W, C)
 
-    merged_labels = _merge_spatial_tensors_max(label_one_hot_list, device)
-    merged_anchors = _merge_spatial_tensors_max(anchors_map_list_norm, device)
-    merged_vis_maps = _merge_spatial_tensors_max(vis_maps_list, device)
-    merged_reg_target, merged_reg_mask = _merge_regression_targets(reg_target_list, reg_loss_mask_list, device)
+    (
+        merged_labels,
+        merged_reg_target,
+        merged_reg_mask,
+        merged_anchors,
+        merged_vis_maps,
+    ) = _reference_supervision_tensors(
+        label_one_hot_list,
+        reg_target_list,
+        reg_loss_mask_list,
+        anchors_map_list_norm,
+        vis_maps_list,
+        device,
+    )
 
     label_shape_ref = _first_nonempty(label_one_hot_list)
     reg_target_ref = _first_nonempty(reg_target_list)
@@ -322,35 +367,33 @@ def assemble_detection_inputs(
     vis_ref = _first_nonempty(vis_maps_list)
 
     if merged_labels is None:
-        merged_labels = torch.zeros((1, *label_shape_ref.shape), device=device) if label_shape_ref is not None else torch.zeros((1,), device=device)
-    else:
-        merged_labels = merged_labels.unsqueeze(0)
+        merged_labels = (
+            torch.zeros((1, *label_shape_ref.shape), device=device)
+            if label_shape_ref is not None
+            else torch.zeros((1,), device=device)
+        )
 
     if merged_reg_target is None:
         if reg_target_ref is not None and reg_mask_ref is not None:
-            merged_reg_target = torch.zeros((*reg_target_ref.shape,), device=device)
-            merged_reg_mask = torch.zeros((*reg_mask_ref.shape,), device=device, dtype=torch.bool)
+            merged_reg_target = _ensure_batch_dim(reg_target_ref, 6)
+            merged_reg_mask = _ensure_batch_dim(reg_mask_ref, 5).bool()
         else:
             merged_reg_target = torch.zeros((1,), device=device)
             merged_reg_mask = torch.zeros((1,), device=device, dtype=torch.bool)
-    else:
-        merged_reg_mask = merged_reg_mask.bool()
-
-    # Ensure batch dimension only once: targets (B,H,W,A,pred_len,code), mask (B,H,W,A,pred_len)
-    if merged_reg_target.dim() == 5:
-        merged_reg_target = merged_reg_target.unsqueeze(0)
-    if merged_reg_mask.dim() == 4:
-        merged_reg_mask = merged_reg_mask.unsqueeze(0)
 
     if merged_anchors is None:
-        merged_anchors = torch.zeros((1, *anchor_ref.shape), device=device) if anchor_ref is not None else torch.zeros((1,), device=device)
-    else:
-        merged_anchors = merged_anchors.unsqueeze(0)
+        merged_anchors = (
+            torch.zeros((1, *anchor_ref.shape), device=device)
+            if anchor_ref is not None
+            else torch.zeros((1,), device=device)
+        )
 
     if merged_vis_maps is None:
-        merged_vis_maps = torch.zeros((1, *vis_ref.shape), device=device) if vis_ref is not None else torch.zeros((1,), device=device)
-    else:
-        merged_vis_maps = merged_vis_maps.unsqueeze(0)
+        merged_vis_maps = (
+            torch.zeros((1, *vis_ref.shape), device=device)
+            if vis_ref is not None
+            else torch.zeros((1,), device=device)
+        )
 
     target_agent_ids = torch.tensor([[torch.as_tensor(target_agent_id_list[0]).item()]], device=device)
     num_all_agents = torch.tensor([[num_selected]], device=device)
