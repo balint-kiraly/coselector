@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import sys
 import time
@@ -263,6 +264,8 @@ def main(args):
     eval_start_idx = 1 if args.rsu else 0
     frames_processed = 0
     cost_config = CostConfig.from_scenario(CostScenario.BALANCED)
+    frame_cost_rows: list = []
+    n_available = 0
 
     for cnt, sample in enumerate(validation_data_loader):
         t = time.time()
@@ -303,6 +306,7 @@ def main(args):
                 return_meta=True,
             )
             state_feats = state_feats.to(device)
+            n_available = len(metas)
             agent_id_to_idx = {
                 agent_id: idx for idx, agent_id in enumerate(agent_idx_range)
             }
@@ -352,6 +356,17 @@ def main(args):
             trans_matrices_list = _sel(trans_matrices_list)
             gt_max_iou = _sel(list(gt_max_iou))
 
+            _valid_teachers = [
+                torch.as_tensor(t)
+                for t in padded_voxel_points_teacher_list
+                if t is not None and torch.as_tensor(t).numel() > 0
+            ]
+            bev_size_bytes = (
+                bev_size_from_tensor(torch.stack(_valid_teachers, dim=0))
+                if _valid_teachers
+                else 0
+            )
+
             # Fuse the selected agents after policy decisions so detector inputs follow
             # the create_data_det alignment/voxelization used during data prep.
             data = assemble_detection_inputs(
@@ -375,6 +390,7 @@ def main(args):
             label_one_hot = data["labels"]
             reg_target = data["reg_targets"]
             anchors_map = data["anchors"]
+            filename0 = filenames[0]
         else:
             filename0 = filenames[0]
             trans_matrices = torch.stack(tuple(trans_matrices_list), 1)
@@ -411,6 +427,7 @@ def main(args):
                 "trans_matrices": trans_matrices.to(device),
             }
             n_for_cost = len(agent_idx_range)
+            n_available = n_for_cost
 
             teacher_stack = torch.stack(
                 [
@@ -450,14 +467,27 @@ def main(args):
             loss, cls_loss, loc_loss, result = predict_out
 
         comm_cost = compute_cost(n_for_cost, cost_config, bev_size_bytes, inference_time_ms)
+        frame_cost_rows.append({
+            "scene_id": scene_id,
+            "frame_id": frame_id,
+            "flag": flag,
+            "sel_method": args.sel_method if args.selection else "all_agents",
+            "n_available": n_available,
+            "n_selected": n_for_cost,
+            "bandwidth_MB": comm_cost.bandwidth_MB,
+            "latency_upload_ms": comm_cost.latency_upload_ms,
+            "latency_proc_ms": comm_cost.latency_proc_ms,
+            "latency_total_ms": comm_cost.latency_total_ms,
+            "combined_cost": comm_cost.combined_cost,
+        })
 
         box_color_map = ["red", "yellow", "blue", "purple", "black", "orange"]
 
-        # If has RSU, do not count RSU's output into evaluation
-        if not args.selection:
-            eval_start_idx = 1 if args.rsu else 0
         if args.selection:
+            eval_start_idx = 0
             num_agent = 1
+        else:
+            eval_start_idx = 1 if args.rsu else 0
 
         # local qualitative evaluation
         for k in range(eval_start_idx, num_agent):
@@ -666,6 +696,47 @@ def main(args):
         )
     )
 
+    # ------------------------------------------------------------------
+    # CSV output
+    # ------------------------------------------------------------------
+    csv_dir = args.csv_path if args.csv_path else logger_root
+
+    # Per-frame cost CSV
+    frame_csv_path = os.path.join(csv_dir, "frame_costs.csv")
+    if frame_cost_rows:
+        frame_fieldnames = list(frame_cost_rows[0].keys())
+        with open(frame_csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=frame_fieldnames)
+            writer.writeheader()
+            writer.writerows(frame_cost_rows)
+        print_and_write_log(f"Per-frame cost CSV saved to {frame_csv_path}")
+
+    # Summary CSV
+    summary_csv_path = os.path.join(csv_dir, "summary.csv")
+    avg_bandwidth = sum(r["bandwidth_MB"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
+    avg_latency = sum(r["latency_total_ms"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
+    avg_cost = sum(r["combined_cost"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
+    summary_row = {
+        "flag": flag,
+        "sel_method": args.sel_method if args.selection else "all_agents",
+        "rsu": args.rsu,
+        "scene_begin": args.scene_begin,
+        "scene_end": args.scene_end,
+        "n_frames": frames_processed,
+        "mAP_05": mean_ap_local[-2],
+        "mAP_07": mean_ap_local[-1],
+        "avg_bandwidth_MB": avg_bandwidth,
+        "avg_latency_ms": avg_latency,
+        "avg_combined_cost": avg_cost,
+    }
+    write_header = not os.path.exists(summary_csv_path)
+    with open(summary_csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary_row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(summary_row)
+    print_and_write_log(f"Summary CSV saved/appended to {summary_csv_path}")
+
     if need_log:
         saver.close()
 
@@ -799,6 +870,13 @@ if __name__ == "__main__":
         default=None,
         type=str,
         help="Path to the trained agent selection model",
+    )
+    parser.add_argument(
+        "--csv_path",
+        default="",
+        type=str,
+        help="Directory to write CSV outputs (frame_costs.csv, summary.csv). "
+             "Defaults to the same directory as log_test.txt.",
     )
 
     torch.multiprocessing.set_sharing_strategy("file_system")

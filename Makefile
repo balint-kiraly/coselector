@@ -1,9 +1,9 @@
 # Path to the original V2X-Sim dataset
-original_data_path := ../data/V2X-Sim-2
+original_data_path := /mnt/10TB/balintkiraly/data/V2X-Sim-2
 # Where to save the created bev data
-create_bev_data_save_path := ./created_data/V2X-Sim-det
+create_bev_data_save_path := /mnt/10TB/balintkiraly/created_data/V2X-Sim-det
 # Where to save the created state data
-create_state_data_save_path := ./created_data/V2X-Sim-States
+create_state_data_save_path := /mnt/10TB/balintkiraly/created_data/V2X-Sim-States
 # Index of the beginning scene
 scene_begin := 0
  # Index of the ending scene + 1
@@ -16,7 +16,7 @@ to_agent := 6 # max 6
 dataset_version := v2.0
 
 # Path to the test/val data
-testing_data := $(create_bev_data_save_path)/V2X-Sim-det/test
+testing_data := $(create_bev_data_save_path)/test
 # [lowerbound / upperbound / v2v / disco / when2com / max / mean / sum / agent]
 com := upperbound
 batch_size := 4
@@ -63,24 +63,45 @@ plot_agents:
 		--state_root $(create_state_data_save_path) \
 		--save_path $(create_state_data_save_path)/agent_counts.png
 
+# Selection method: identity | closest_k | heuristic | ml_model
+sel_method := identity
+# RSU: 0 = no RSU (agents 1-5), 1 = include RSU (agent 0)
+rsu := 0
+# Number of agents (including RSU slot 0); keep at 6 for V2X-Sim
+num_agent := 6
+
 test:
 	python test_codet_selector.py \
-	--data $(original_data_path) \
-	--data_prep $(testing_data)
+	--data_prep $(testing_data) \
 	--state_path $(create_state_data_save_path) \
 	--com $(com) \
-	--resume $(checkpoint_path)/$(com)/with_rsu/epoch_$(n_epoch).pth \ #without?
-	#--tracking \
+	--resume $(checkpoint_path)/$(com)/no_rsu/epoch_$(n_epoch).pth \
 	--logpath $(log_path) \
 	--apply_late_fusion $(apply_late_fusion) \
 	--visualization $(visualization) \
-	--rsu 1 \
-	--scene_begin 0 \
+	--rsu $(rsu) \
+	--num_agent $(num_agent) \
+	--scene_begin 5 \
 	--scene_end 20 \
-	--sel_method "ml_model" \
-	--sel_model_path ${checkpoint_path}/selector_models/agent_selector.pth
+	--selection \
+	--sel_method $(sel_method)
 
-# --data ../data/V2X-Sim-2 --data_prep ./created_data/V2X-Sim-det/test --state_path ./created_data/V2X-Sim-States --com upperbound --resume checkpoints/upperbound/with_rsu/epoch_100.pth	--logpath logs --apply_late_fusion 1 --visualization 0 --rsu 1 --scene_begin 0	--scene_end 20 --sel_method "ml_model" --sel_model_path checkpoints/selector_models/agent_selector.pth
+test_identity:
+	$(MAKE) test sel_method=identity
+
+test_all_agents:
+	python test_codet_selector.py \
+	--data_prep $(testing_data) \
+	--state_path $(create_state_data_save_path) \
+	--com $(com) \
+	--resume $(checkpoint_path)/$(com)/no_rsu/epoch_$(n_epoch).pth \
+	--logpath $(log_path) \
+	--apply_late_fusion $(apply_late_fusion) \
+	--visualization $(visualization) \
+	--rsu $(rsu) \
+	--num_agent $(num_agent) \
+	--scene_begin 5 \
+	--scene_end 20
 
 train_selector:
 	python -m selection.train_selector \
