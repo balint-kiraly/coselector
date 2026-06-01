@@ -103,7 +103,9 @@ def main(args):
         config_global=config_global,
         split="val",
         val=True,
-        bound="upperbound" if args.com == "upperbound" else "lowerbound",
+        bound="lowerbound" if args.selection else (
+            "upperbound" if args.com == "upperbound" else "lowerbound"
+        ),
         kd_flag=args.kd_flag,
         rsu=args.rsu,
     )
@@ -341,6 +343,13 @@ def main(args):
             selected_num_agents = len(selected_indices)
             n_for_cost = selected_num_agents
 
+            # Extract per-agent (4,4) transform matrices from the reference agent's
+            # perspective table BEFORE _sel() modifies trans_matrices_list.
+            # trans_matrices_list[0] is the first loaded agent's table (shape 1, N, 4, 4).
+            # Slot [0, j] = transform from agent j's frame INTO the reference frame.
+            _ref_table = torch.as_tensor(trans_matrices_list[0])  # (1, N, 4, 4)
+            trans_sel = [_ref_table[0, j] for j in selected_indices]  # list of (4,4)
+
             def _sel(lst):
                 return [lst[i] for i in selected_indices]
 
@@ -353,22 +362,26 @@ def main(args):
             vis_maps_list = _sel(vis_maps_list)
             target_agent_id_list = _sel(target_agent_id_list)
             num_agent_list = _sel(num_agent_list)
-            trans_matrices_list = _sel(trans_matrices_list)
+            # trans_matrices_list is NOT passed through _sel — trans_sel above replaces it.
             gt_max_iou = _sel(list(gt_max_iou))
 
-            _valid_teachers = [
+            # Bandwidth cost: size of an individual BEV upload (pvp_list, lowerbound).
+            # Each selected vehicle transmits its own unseen individual BEV, not the
+            # pre-fused oracle teacher BEV.
+            _valid_pvp = [
                 torch.as_tensor(t)
-                for t in padded_voxel_points_teacher_list
-                if t is not None and torch.as_tensor(t).numel() > 0
+                for t in padded_voxel_point_list
+                if t is not None and not isinstance(t, list)
+                and torch.as_tensor(t).numel() > 0
             ]
             bev_size_bytes = (
-                bev_size_from_tensor(torch.stack(_valid_teachers, dim=0))
-                if _valid_teachers
+                bev_size_from_tensor(torch.stack(_valid_pvp, dim=0))
+                if _valid_pvp
                 else 0
             )
 
-            # Fuse the selected agents after policy decisions so detector inputs follow
-            # the create_data_det alignment/voxelization used during data prep.
+            # Fuse selected vehicles' individual BEVs into the reference frame.
+            # trans_sel carries a (4,4) matrix per vehicle: vehicle_j → reference frame.
             data = assemble_detection_inputs(
                 config,
                 padded_voxel_point_list,
@@ -380,7 +393,7 @@ def main(args):
                 vis_maps_list,
                 target_agent_id_list,
                 num_agent_list,
-                trans_matrices_list,
+                trans_sel,
                 device,
             )
 
@@ -492,7 +505,10 @@ def main(args):
         # local qualitative evaluation
         for k in range(eval_start_idx, num_agent):
             box_colors = None
-            if apply_late_fusion == 1 and len(result[k]) != 0:
+            # Late fusion is not applicable in selection mode: BEVs have already
+            # been fused at the data level before the detector runs.
+            run_late_fusion = apply_late_fusion == 1 and not args.selection
+            if run_late_fusion and len(result[k]) != 0:
                 pred_restore = result[k][0][0][0]["pred"]
                 score_restore = result[k][0][0][0]["score"]
                 selected_idx_restore = result[k][0][0][0]["selected_idx"]
@@ -510,7 +526,7 @@ def main(args):
                 data_agents["gt_max_iou"] = temp[0]["gt_box"][0, :, :]
 
             # late fusion
-            if apply_late_fusion == 1 and len(result[k]) != 0:
+            if run_late_fusion and len(result[k]) != 0:
                 box_colors = late_fusion(
                     k, num_agent, result, trans_matrices, box_color_map
                 )
@@ -595,7 +611,7 @@ def main(args):
                 det_file.close()
 
             # restore data before late-fusion
-            if apply_late_fusion == 1 and len(result[k]) != 0:
+            if run_late_fusion and len(result[k]) != 0:
                 result[k][0][0][0]["pred"] = pred_restore
                 result[k][0][0][0]["score"] = score_restore
                 result[k][0][0][0]["selected_idx"] = selected_idx_restore
