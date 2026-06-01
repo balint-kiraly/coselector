@@ -21,6 +21,12 @@ from coperception.utils.detection_util import late_fusion
 from coperception.utils.data_util import apply_pose_noise
 
 from data_utils.build_state_features import build_state_features
+from data_utils.cost_model import (
+    CostConfig,
+    CostScenario,
+    bev_size_from_tensor,
+    compute_cost,
+)
 from data_utils.state_index import StateIndex
 from selection.bev_builder import assemble_detection_inputs
 from selection.models import AgentSelectorMLP
@@ -31,6 +37,21 @@ def check_folder(folder_path):
     if not os.path.exists(folder_path):
         os.mkdir(folder_path)
     return folder_path
+
+
+def _sync_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _timed_forward(device, forward_fn):
+    """Run ``forward_fn`` and return ``(result, inference_time_ms)`` with GPU sync."""
+    _sync_device(device)
+    t0 = time.perf_counter()
+    result = forward_fn()
+    _sync_device(device)
+    inference_time_ms = (time.perf_counter() - t0) * 1000.0
+    return result, inference_time_ms
 
 
 @torch.no_grad()
@@ -241,6 +262,7 @@ def main(args):
     sel_model = None
     eval_start_idx = 1 if args.rsu else 0
     frames_processed = 0
+    cost_config = CostConfig.from_scenario(CostScenario.BALANCED)
 
     for cnt, sample in enumerate(validation_data_loader):
         t = time.time()
@@ -313,6 +335,7 @@ def main(args):
                 continue
 
             selected_num_agents = len(selected_indices)
+            n_for_cost = selected_num_agents
 
             def _sel(lst):
                 return [lst[i] for i in selected_indices]
@@ -387,27 +410,46 @@ def main(args):
                 "num_agent": num_all_agents.to(device),
                 "trans_matrices": trans_matrices.to(device),
             }
+            n_for_cost = len(agent_idx_range)
+
+            teacher_stack = torch.stack(
+                [
+                    torch.as_tensor(t)
+                    for t in padded_voxel_points_teacher_list
+                    if t is not None and torch.as_tensor(t).numel() > 0
+                ],
+                dim=0,
+            )
+            bev_size_bytes = bev_size_from_tensor(teacher_stack)
 
         if args.selection:
-            loss, cls_loss, loc_loss, result = fafmodule.predict_all(
-                data, 1, num_agent=1
+            predict_out, inference_time_ms = _timed_forward(
+                device,
+                lambda: fafmodule.predict_all(data, 1, num_agent=1),
             )
+            loss, cls_loss, loc_loss, result = predict_out
         elif flag == "lowerbound_box_com":
-            loss, cls_loss, loc_loss, result = fafmodule.predict_all_with_box_com(
-                data, data["trans_matrices"]
+            predict_out, inference_time_ms = _timed_forward(
+                device,
+                lambda: fafmodule.predict_all_with_box_com(
+                    data, data["trans_matrices"]
+                ),
             )
+            loss, cls_loss, loc_loss, result = predict_out
         elif flag == "disco":
-            (
-                loss,
-                cls_loss,
-                loc_loss,
-                result,
-                save_agent_weight_list,
-            ) = fafmodule.predict_all(data, 1, num_agent=num_agent)
-        else:
-            loss, cls_loss, loc_loss, result = fafmodule.predict_all(
-                data, 1, num_agent=num_agent
+            predict_out, inference_time_ms = _timed_forward(
+                device,
+                lambda: fafmodule.predict_all(data, 1, num_agent=num_agent),
             )
+            loss, cls_loss, loc_loss, result, save_agent_weight_list = predict_out
+        else:
+            predict_out, inference_time_ms = _timed_forward(
+                device,
+                lambda: fafmodule.predict_all(data, 1, num_agent=num_agent),
+            )
+            loss, cls_loss, loc_loss, result = predict_out
+
+        comm_cost = compute_cost(n_for_cost, cost_config, bev_size_bytes, inference_time_ms)
 
         box_color_map = ["red", "yellow", "blue", "purple", "black", "orange"]
 
@@ -529,6 +571,7 @@ def main(args):
                 result[k][0][0][0]["selected_idx"] = selected_idx_restore
 
         print("Validation scene {}, at frame {}".format(seq_name, idx))
+        print("Communication cost: {}".format(comm_cost))
         print("Takes {} s\n".format(str(time.time() - t)))
         frames_processed += 1
 
