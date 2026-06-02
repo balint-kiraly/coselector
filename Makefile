@@ -89,12 +89,37 @@ test:
 test_identity:
 	$(MAKE) test sel_method=identity
 
+# RSU-centric with planar BEV fusion (Z-preserving transform).
+# Vehicles send their own BEVs; RSU transforms (X,Y) into its frame and keeps
+# vehicle-frame Z so voxels survive the ~5.5 m height offset.  GT labels are 2D.
+# Uses upperbound/no_rsu checkpoint: trained on dense merged vehicle BEVs
+# (closest density match; no RSU lidar — correct for Option B).
+lb_checkpoint_path := /home/bkiraly/coperception/tools/det/checkpoints
+test_identity_rsu:
+	python test_codet_selector.py \
+	--data_prep $(testing_data) \
+	--state_path $(create_state_data_save_path) \
+	--com lowerbound \
+	--resume $(lb_checkpoint_path)/upperbound/no_rsu/epoch_$(n_epoch).pth \
+	--logpath $(log_path) \
+	--apply_late_fusion 0 \
+	--visualization $(visualization) \
+	--rsu 1 \
+	--num_agent $(num_agent) \
+	--scene_begin 5 \
+	--scene_end 20 \
+	--selection \
+	--sel_method $(sel_method)
+
+# rsu_suffix: no_rsu or with_rsu — auto-selected based on rsu flag
+rsu_suffix := $(if $(filter 1,$(rsu)),with_rsu,no_rsu)
+
 test_all_agents:
 	python test_codet_selector.py \
 	--data_prep $(testing_data) \
 	--state_path $(create_state_data_save_path) \
 	--com $(com) \
-	--resume $(checkpoint_path)/$(com)/no_rsu/epoch_$(n_epoch).pth \
+	--resume $(lb_checkpoint_path)/$(com)/$(rsu_suffix)/epoch_$(n_epoch).pth \
 	--logpath $(log_path) \
 	--apply_late_fusion $(apply_late_fusion) \
 	--visualization $(visualization) \
@@ -102,6 +127,47 @@ test_all_agents:
 	--num_agent $(num_agent) \
 	--scene_begin 5 \
 	--scene_end 20
+
+# ── RSU-centric fine-tuning ──────────────────────────────────────────────────
+# Warm-starts from upperbound/with_rsu (all-agents oracle) and fine-tunes on
+# random vehicle subsets merged in RSU frame. Produces a model robust to any k
+# selected agents.  Safe defaults: 30 epochs, early-stop patience=7, AMP on.
+rsu_ckpt_save := /home/bkiraly/coselector/checkpoints/rsu_centric
+min_agents := 1
+max_agents := 5
+train_patience := 7
+
+# Warm-start from upperbound/no_rsu (vehicles 1-5 merged, no RSU lidar).
+# Option B: RSU is a passive relay — RSU lidar is never included.
+# The only difference vs the pretrained model is the reference frame
+# (agent1 frame → RSU frame), which fine-tuning corrects in ~10 epochs.
+train_rsu_centric:
+	python training/train_rsu_centric.py \
+	--data_train $(create_bev_data_save_path)/train \
+	--data_val   $(create_bev_data_save_path)/val \
+	--resume     $(lb_checkpoint_path)/upperbound/no_rsu/epoch_$(n_epoch).pth \
+	--logpath    $(rsu_ckpt_save) \
+	--nepoch     30 \
+	--batch_size $(batch_size) \
+	--nworker    4 \
+	--lr         1e-4 \
+	--min_agents $(min_agents) \
+	--max_agents $(max_agents) \
+	--patience   $(train_patience) \
+	--amp
+
+# Quick 2-epoch smoke test (no warm start, tiny lr, just verifies the pipeline)
+train_rsu_centric_smoke:
+	python training/train_rsu_centric.py \
+	--data_train $(create_bev_data_save_path)/train \
+	--data_val   $(create_bev_data_save_path)/val \
+	--logpath    /tmp/rsu_centric_smoke \
+	--nepoch     2 \
+	--batch_size 2 \
+	--nworker    2 \
+	--lr         1e-4 \
+	--min_agents 2 \
+	--max_agents 3
 
 train_selector:
 	python -m selection.train_selector \

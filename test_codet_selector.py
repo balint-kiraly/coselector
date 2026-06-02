@@ -343,9 +343,26 @@ def main(args):
             selected_num_agents = len(selected_indices)
             n_for_cost = selected_num_agents
 
+            # --- Phase 2: RSU-centric mode ---
+            # With --rsu 1, index 0 in the loaded data is the RSU (agent 0).
+            # Save its GT boxes and supervision tensors BEFORE _sel() filters
+            # the lists down to selected vehicles. Evaluation is against RSU GT;
+            # supervision tensors are prepended to assemble_detection_inputs so
+            # the reference frame labels/anchors come from the RSU.
+            if args.rsu:
+                rsu_gt_max_iou = gt_max_iou[0]
+                rsu_label_one_hot = label_one_hot_list[0]
+                rsu_reg_target = reg_target_list[0]
+                rsu_reg_loss_mask = reg_loss_mask_list[0]
+                rsu_anchors_map = anchors_map_list[0]
+                rsu_vis_maps = vis_maps_list[0]
+            else:
+                rsu_gt_max_iou = None
+
             # Extract per-agent (4,4) transform matrices from the reference agent's
             # perspective table BEFORE _sel() modifies trans_matrices_list.
-            # trans_matrices_list[0] is the first loaded agent's table (shape 1, N, 4, 4).
+            # With --rsu 1: trans_matrices_list[0] = RSU's perspective table (1,6,4,4).
+            # With --rsu 0: trans_matrices_list[0] = agent 1's table (1,5,4,4).
             # Slot [0, j] = transform from agent j's frame INTO the reference frame.
             _ref_table = torch.as_tensor(trans_matrices_list[0])  # (1, N, 4, 4)
             trans_sel = [_ref_table[0, j] for j in selected_indices]  # list of (4,4)
@@ -380,17 +397,33 @@ def main(args):
                 else 0
             )
 
+            # In RSU-centric mode, prepend RSU's supervision tensors so that
+            # assemble_detection_inputs picks the RSU frame's labels/anchors as
+            # the reference (first-non-empty) for loss computation.
+            if args.rsu:
+                assemble_labels      = [rsu_label_one_hot]   + list(label_one_hot_list)
+                assemble_reg_target  = [rsu_reg_target]      + list(reg_target_list)
+                assemble_reg_mask    = [rsu_reg_loss_mask]   + list(reg_loss_mask_list)
+                assemble_anchors_map = [rsu_anchors_map]     + list(anchors_map_list)
+                assemble_vis_maps    = [rsu_vis_maps]        + list(vis_maps_list)
+            else:
+                assemble_labels      = label_one_hot_list
+                assemble_reg_target  = reg_target_list
+                assemble_reg_mask    = reg_loss_mask_list
+                assemble_anchors_map = anchors_map_list
+                assemble_vis_maps    = vis_maps_list
+
             # Fuse selected vehicles' individual BEVs into the reference frame.
             # trans_sel carries a (4,4) matrix per vehicle: vehicle_j → reference frame.
             data = assemble_detection_inputs(
                 config,
                 padded_voxel_point_list,
                 padded_voxel_points_teacher_list,
-                label_one_hot_list,
-                reg_target_list,
-                reg_loss_mask_list,
-                anchors_map_list,
-                vis_maps_list,
+                assemble_labels,
+                assemble_reg_target,
+                assemble_reg_mask,
+                assemble_anchors_map,
+                assemble_vis_maps,
                 target_agent_id_list,
                 num_agent_list,
                 trans_sel,
@@ -442,15 +475,21 @@ def main(args):
             n_for_cost = len(agent_idx_range)
             n_available = n_for_cost
 
-            teacher_stack = torch.stack(
-                [
+            _teacher_tensors = [
+                torch.as_tensor(t)
+                for t in padded_voxel_points_teacher_list
+                if t is not None and torch.as_tensor(t).numel() > 0
+            ]
+            if _teacher_tensors:
+                bev_size_bytes = bev_size_from_tensor(torch.stack(_teacher_tensors, dim=0))
+            else:
+                # lowerbound: no teacher BEVs; measure individual BEVs instead
+                _lb_tensors = [
                     torch.as_tensor(t)
-                    for t in padded_voxel_points_teacher_list
+                    for t in padded_voxel_point_list
                     if t is not None and torch.as_tensor(t).numel() > 0
-                ],
-                dim=0,
-            )
-            bev_size_bytes = bev_size_from_tensor(teacher_stack)
+                ]
+                bev_size_bytes = bev_size_from_tensor(torch.stack(_lb_tensors, dim=0)) if _lb_tensors else 0
 
         if args.selection:
             predict_out, inference_time_ms = _timed_forward(
@@ -518,7 +557,11 @@ def main(args):
                 "reg_targets": torch.unsqueeze(reg_target[k, :, :, :, :, :], 0),
                 "anchors": torch.unsqueeze(anchors_map[k, :, :, :, :], 0),
             }
-            temp = gt_max_iou[k]
+            # RSU-centric: evaluate against RSU GT boxes, not the selected vehicle's GT.
+            if args.rsu and args.selection:
+                temp = rsu_gt_max_iou
+            else:
+                temp = gt_max_iou[k]
 
             if len(temp[0]["gt_box"]) == 0:
                 data_agents["gt_max_iou"] = []
