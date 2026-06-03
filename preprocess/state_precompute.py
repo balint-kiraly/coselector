@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 
+from coperception.utils.v2x_sim_scene_split.parser import parse_scene_files
 from data_utils.state_index import StateIndex
 
 def agent_meta_to_dict(am):
@@ -46,10 +47,24 @@ def main():
         type=str,
         help="Directory for saving the generated data",
     )
+    parser.add_argument(
+        "--only_split", default=None, type=str,
+        help="If set, only save state data for scenes in this split (train/val/test).",
+    )
 
     args = parser.parse_args()
 
     os.makedirs(args.save_path, exist_ok=True)
+
+    # Resolve split filter
+    only_split_scenes = None
+    if args.only_split:
+        scene_files_loc = os.path.join(
+            os.path.dirname(__file__), '..', 'configs', 'scene_split'
+        )
+        scene_splits = parse_scene_files(scene_files_loc)
+        only_split_scenes = scene_splits[args.only_split]
+        print(f"Filtering: only processing '{args.only_split}' scenes ({sorted(only_split_scenes)}).")
 
     # Does not include RSU data
     state_index = StateIndex(
@@ -63,6 +78,8 @@ def main():
     state_index.build_index()
 
     for (scene_id, frame_id), metas in state_index.frame_index.items():
+        if only_split_scenes is not None and scene_id not in only_split_scenes:
+            continue
         scene_dir = os.path.join(args.save_path, f"scene_{scene_id:03d}")
         os.makedirs(scene_dir, exist_ok=True)
 
