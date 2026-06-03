@@ -14,9 +14,11 @@ from_agent := 0
 to_agent := 6 # max 6
 # [v2.0 / v2.0-mini]
 dataset_version := v2.0
+# Optional split filter: set to train/val/test to skip other splits (leave empty for all)
+only_split :=
 
-# Path to the test/val data
-testing_data := $(create_bev_data_save_path)/test
+# Path to the val data (matches coperception evaluation split)
+testing_data := $(create_bev_data_save_path)/val
 # [lowerbound / upperbound / v2v / disco / when2com / max / mean / sum / agent]
 com := upperbound
 batch_size := 4
@@ -36,13 +38,15 @@ create_data:
 		--root $(original_data_path) \
 		--scene_begin $(scene_begin) \
 		--scene_end $(scene_end) \
-		--save_path $(create_bev_data_save_path)
+		--save_path $(create_bev_data_save_path) \
+		$(if $(only_split),--only_split $(only_split),)
 
 	python -m preprocess.state_precompute \
 		--root $(original_data_path) \
 		--scene_begin $(scene_begin) \
 		--scene_end $(scene_end) \
-		--save_path $(create_state_data_save_path)
+		--save_path $(create_state_data_save_path) \
+		$(if $(only_split),--only_split $(only_split),)
 
 inspect_sensor:
 	python tools/inspect_sensor_data.py \
@@ -81,8 +85,6 @@ test:
 	--visualization $(visualization) \
 	--rsu $(rsu) \
 	--num_agent $(num_agent) \
-	--scene_begin 5 \
-	--scene_end 20 \
 	--selection \
 	--sel_method $(sel_method)
 
@@ -106,8 +108,6 @@ test_identity_rsu:
 	--visualization $(visualization) \
 	--rsu 1 \
 	--num_agent $(num_agent) \
-	--scene_begin 5 \
-	--scene_end 20 \
 	--selection \
 	--sel_method $(sel_method)
 
@@ -124,9 +124,7 @@ test_all_agents:
 	--apply_late_fusion $(apply_late_fusion) \
 	--visualization $(visualization) \
 	--rsu $(rsu) \
-	--num_agent $(num_agent) \
-	--scene_begin 5 \
-	--scene_end 20
+	--num_agent $(num_agent)
 
 # ── RSU-centric fine-tuning ──────────────────────────────────────────────────
 # Warm-starts from upperbound/with_rsu (all-agents oracle) and fine-tunes on

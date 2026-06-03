@@ -24,7 +24,7 @@ def check_folder(folder_name):
 
 
 # ---------------------- Extract the scenes, and then pre-process them into BEV maps ----------------------
-def create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args_savepath):
+def create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args_savepath, only_split=None):
     channel = "LIDAR_TOP_id_" + str(current_agent)
     total_sample = 0
     res_scenes = range(100)
@@ -36,14 +36,18 @@ def create_data(coperception_dataset, current_agent, scene_begin, scene_end, sce
     for scene_idx in res_scenes[scene_begin:scene_end]:
         curr_scene = coperception_dataset.scene[scene_idx]
         split = None
-        
+
         for s in ['train', 'val', 'test']:
             if scene_idx in scene_splits[s]:
                 split = s
                 config.split = s
-        
+
         if not split:
             raise Exception(f'There is no scene {scene_idx} in the dataset.')
+
+        # Skip scenes that don't belong to the requested split
+        if only_split and split != only_split:
+            continue
 
         savepath = os.path.join(args_savepath, split, "agent" + str(current_agent))
         os.makedirs(savepath, exist_ok=True)
@@ -614,6 +618,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset_version", default='v2.0', type=str, help="[v2.0 / v2.0-mini]"
     )
+    parser.add_argument(
+        "--only_split", default=None, type=str,
+        help="If set, only process scenes belonging to this split (train/val/test). "
+             "Scenes from other splits in the scene_begin..scene_end range are skipped.",
+    )
     args = parser.parse_args()
 
     dataset_version = args.dataset_version
@@ -633,5 +642,8 @@ if __name__ == "__main__":
 
     print(f'Parsed files will be saved to {args.savepath}')
 
+    if args.only_split:
+        print(f"Filtering: only processing '{args.only_split}' scenes.")
+
     for current_agent in range(args.from_agent, args.to_agent):
-        create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args.savepath)
+        create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args.savepath, only_split=args.only_split)
