@@ -1,5 +1,5 @@
 # Path to the original V2X-Sim dataset
-original_data_path := /mnt/10TB/balintkiraly/data/V2X-Sim-2
+original_data_path := /mnt/10TB/balintkiraly/data/data/V2X-Sim-2
 # Where to save the created bev data
 create_bev_data_save_path := /mnt/10TB/balintkiraly/created_data/V2X-Sim-det
 # Where to save the created state data
