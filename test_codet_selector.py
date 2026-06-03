@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import sys
 import time
@@ -21,7 +22,14 @@ from coperception.utils.detection_util import late_fusion
 from coperception.utils.data_util import apply_pose_noise
 
 from data_utils.build_state_features import build_state_features
+from data_utils.cost_model import (
+    CostConfig,
+    CostScenario,
+    bev_size_from_tensor,
+    compute_cost,
+)
 from data_utils.state_index import StateIndex
+from selection.bev_builder import assemble_detection_inputs
 from selection.models import AgentSelectorMLP
 from selection.policy import select_agents_from_metadata, SelectionMethod
 
@@ -30,6 +38,21 @@ def check_folder(folder_path):
     if not os.path.exists(folder_path):
         os.mkdir(folder_path)
     return folder_path
+
+
+def _sync_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _timed_forward(device, forward_fn):
+    """Run ``forward_fn`` and return ``(result, inference_time_ms)`` with GPU sync."""
+    _sync_device(device)
+    t0 = time.perf_counter()
+    result = forward_fn()
+    _sync_device(device)
+    inference_time_ms = (time.perf_counter() - t0) * 1000.0
+    return result, inference_time_ms
 
 
 @torch.no_grad()
@@ -80,7 +103,9 @@ def main(args):
         config_global=config_global,
         split="val",
         val=True,
-        bound="upperbound" if args.com == "upperbound" else "lowerbound",
+        bound="lowerbound" if args.selection else (
+            "upperbound" if args.com == "upperbound" else "lowerbound"
+        ),
         kd_flag=args.kd_flag,
         rsu=args.rsu,
     )
@@ -95,7 +120,11 @@ def main(args):
     if not args.rsu:
         num_agent -= 1
 
-    if flag == "upperbound" or flag.startswith("lowerbound"):
+    if args.selection:
+        model = FaFNet(
+            config, layer=args.layer, kd_flag=0, num_agent=1
+        )
+    elif flag == "upperbound" or flag.startswith("lowerbound"):
         model = FaFNet(
             config, layer=args.layer, kd_flag=args.kd_flag, num_agent=num_agent
         )
@@ -200,6 +229,13 @@ def main(args):
     saver.write(args.__repr__() + "\n\n")
     saver.flush()
 
+    if not os.path.isfile(args.resume):
+        rsu_hint = "with_rsu" if args.rsu else "no_rsu"
+        raise FileNotFoundError(
+            f"Checkpoint not found: {args.resume}. "
+            f"With --rsu {args.rsu}, use a checkpoint trained for {rsu_hint}."
+        )
+
     checkpoint = torch.load(
         args.resume, map_location="cpu"
     )  # We have low GPU utilization for testing
@@ -227,6 +263,11 @@ def main(args):
     tracking_file = [set()] * num_agent
 
     sel_model = None
+    eval_start_idx = 1 if args.rsu else 0
+    frames_processed = 0
+    cost_config = CostConfig.from_scenario(CostScenario.BALANCED)
+    frame_cost_rows: list = []
+    n_available = 0
 
     for cnt, sample in enumerate(validation_data_loader):
         t = time.time()
@@ -247,114 +288,266 @@ def main(args):
 
         filename0 = filenames[0][0][0]
 
-        # --------------------------------------------------
-        # Agent selection: build state features, run policy
-        # --------------------------------------------------
-
         parts = filename0.split(os.sep)
         scene_frame = parts[-2]  # e.g. "12_5"
         scene_id, frame_id = map(int, scene_frame.split("_"))
 
-        state_feats = build_state_features(
-            state_index=state_index,
-            scene_id=scene_id,
-            frame_id=frame_id,
-        )
-        state_feats = state_feats.to(device)
+        if scene_id < args.scene_begin or scene_id >= args.scene_end:
+            print(f"Skipping scene {scene_id} as it is outside the range [{args.scene_begin}, {args.scene_end})")
+            continue
 
-        # ------------------ Agent Selection Model ------------------
-        if cnt == 0 and args.sel_method == "ml_model":
-            sel_model = AgentSelectorMLP(input_dim=state_feats.shape[1])
-            sel_model = sel_model.to(device)
-            #sel_model = nn.DataParallel(sel_model)
-            assert args.sel_model_path is not None, "Path to trained agent selection model is not provided"
-            sel_model.load_state_dict(torch.load(args.sel_model_path))
-            sel_model.eval()
-            print(f"Loaded agent selection model from {args.sel_model_path}")
+        if args.selection:
+            # --------------------------------------------------
+            # Agent selection: build state features, run policy
+            # --------------------------------------------------
 
-        selected_indices = select_agents_from_metadata(
-            state_feats,
-            method=SelectionMethod(args.sel_method),
-            model=sel_model,
-        )
-
-        def _sel(lst):
-            return [lst[i] for i in selected_indices]
-
-        padded_voxel_point_list = _sel(padded_voxel_point_list)
-        padded_voxel_points_teacher_list = _sel(padded_voxel_points_teacher_list)
-        label_one_hot_list = _sel(label_one_hot_list)
-        reg_target_list = _sel(reg_target_list)
-        reg_loss_mask_list = _sel(reg_loss_mask_list)
-        anchors_map_list = _sel(anchors_map_list)
-        vis_maps_list = _sel(vis_maps_list)
-        target_agent_id_list = _sel(target_agent_id_list)
-        num_agent_list = _sel(num_agent_list)
-        trans_matrices_list = _sel(trans_matrices_list)
-
-        selected_num_agents = len(selected_indices)
-
-        trans_matrices = torch.stack(tuple(trans_matrices_list), 1)
-        target_agent_ids = torch.stack(tuple(target_agent_id_list), 1)
-        num_all_agents = torch.stack(tuple(num_agent_list), 1)
-        num_all_agents[:] = selected_num_agents
-
-        # add pose noise
-        if pose_noise > 0:
-            apply_pose_noise(pose_noise, trans_matrices)
-
-        if not args.rsu:
-            num_all_agents -= 1
-
-        if flag == "upperbound":
-            padded_voxel_points = torch.cat(tuple(padded_voxel_points_teacher_list), 0)
-        else:
-            padded_voxel_points = torch.cat(tuple(padded_voxel_point_list), 0)
-
-        label_one_hot = torch.cat(tuple(label_one_hot_list), 0)
-        reg_target = torch.cat(tuple(reg_target_list), 0)
-        reg_loss_mask = torch.cat(tuple(reg_loss_mask_list), 0)
-        anchors_map = torch.cat(tuple(anchors_map_list), 0)
-        vis_maps = torch.cat(tuple(vis_maps_list), 0)
-
-        data = {
-            "bev_seq": padded_voxel_points.to(device),
-            "labels": label_one_hot.to(device),
-            "reg_targets": reg_target.to(device),
-            "anchors": anchors_map.to(device),
-            "vis_maps": vis_maps.to(device),
-            "reg_loss_mask": reg_loss_mask.to(device).type(dtype=torch.bool),
-            "target_agent_ids": target_agent_ids.to(device),
-            "num_agent": num_all_agents.to(device),
-            "trans_matrices": trans_matrices.to(device),
-        }
-
-        if flag == "lowerbound_box_com":
-            loss, cls_loss, loc_loss, result = fafmodule.predict_all_with_box_com(
-                data, data["trans_matrices"]
+            state_feats, metas = build_state_features(
+                state_index=state_index,
+                scene_id=scene_id,
+                frame_id=frame_id,
+                return_meta=True,
             )
+            state_feats = state_feats.to(device)
+            n_available = len(metas)
+            agent_id_to_idx = {
+                agent_id: idx for idx, agent_id in enumerate(agent_idx_range)
+            }
+
+            # ------------------ Agent Selection Model ------------------
+            if args.selection and args.sel_method == "ml_model" and cnt == 0:
+                sel_model = AgentSelectorMLP(input_dim=state_feats.shape[1])
+                sel_model = sel_model.to(device)
+                #sel_model = nn.DataParallel(sel_model)
+                assert args.sel_model_path is not None, "Path to trained agent selection model is not provided"
+                sel_model.load_state_dict(torch.load(args.sel_model_path))
+                sel_model.eval()
+                print(f"Loaded agent selection model from {args.sel_model_path}")
+
+            selected_state_indices = select_agents_from_metadata(
+                state_feats,
+                method=SelectionMethod(args.sel_method),
+                model=sel_model,
+            )
+            selected_indices = [
+                agent_id_to_idx[metas[i].agent_id]
+                for i in selected_state_indices
+                if metas[i].agent_id in agent_id_to_idx
+            ]
+            if not selected_indices:
+                print(
+                    f"Skipping scene {scene_id} frame {frame_id}: "
+                    "no selected agents match detection dataloader indices"
+                )
+                continue
+
+            selected_num_agents = len(selected_indices)
+            n_for_cost = selected_num_agents
+
+            # --- Phase 2: RSU-centric mode ---
+            # With --rsu 1, index 0 in the loaded data is the RSU (agent 0).
+            # Save its GT boxes and supervision tensors BEFORE _sel() filters
+            # the lists down to selected vehicles. Evaluation is against RSU GT;
+            # supervision tensors are prepended to assemble_detection_inputs so
+            # the reference frame labels/anchors come from the RSU.
+            if args.rsu:
+                rsu_gt_max_iou = gt_max_iou[0]
+                rsu_label_one_hot = label_one_hot_list[0]
+                rsu_reg_target = reg_target_list[0]
+                rsu_reg_loss_mask = reg_loss_mask_list[0]
+                rsu_anchors_map = anchors_map_list[0]
+                rsu_vis_maps = vis_maps_list[0]
+            else:
+                rsu_gt_max_iou = None
+
+            # Extract per-agent (4,4) transform matrices from the reference agent's
+            # perspective table BEFORE _sel() modifies trans_matrices_list.
+            # With --rsu 1: trans_matrices_list[0] = RSU's perspective table (1,6,4,4).
+            # With --rsu 0: trans_matrices_list[0] = agent 1's table (1,5,4,4).
+            # Slot [0, j] = transform from agent j's frame INTO the reference frame.
+            _ref_table = torch.as_tensor(trans_matrices_list[0])  # (1, N, 4, 4)
+            trans_sel = [_ref_table[0, j] for j in selected_indices]  # list of (4,4)
+
+            def _sel(lst):
+                return [lst[i] for i in selected_indices]
+
+            padded_voxel_point_list = _sel(padded_voxel_point_list)
+            padded_voxel_points_teacher_list = _sel(padded_voxel_points_teacher_list)
+            label_one_hot_list = _sel(label_one_hot_list)
+            reg_target_list = _sel(reg_target_list)
+            reg_loss_mask_list = _sel(reg_loss_mask_list)
+            anchors_map_list = _sel(anchors_map_list)
+            vis_maps_list = _sel(vis_maps_list)
+            target_agent_id_list = _sel(target_agent_id_list)
+            num_agent_list = _sel(num_agent_list)
+            # trans_matrices_list is NOT passed through _sel — trans_sel above replaces it.
+            gt_max_iou = _sel(list(gt_max_iou))
+
+            # Bandwidth cost: size of an individual BEV upload (pvp_list, lowerbound).
+            # Each selected vehicle transmits its own unseen individual BEV, not the
+            # pre-fused oracle teacher BEV.
+            _valid_pvp = [
+                torch.as_tensor(t)
+                for t in padded_voxel_point_list
+                if t is not None and not isinstance(t, list)
+                and torch.as_tensor(t).numel() > 0
+            ]
+            bev_size_bytes = (
+                bev_size_from_tensor(torch.stack(_valid_pvp, dim=0))
+                if _valid_pvp
+                else 0
+            )
+
+            # In RSU-centric mode, prepend RSU's supervision tensors so that
+            # assemble_detection_inputs picks the RSU frame's labels/anchors as
+            # the reference (first-non-empty) for loss computation.
+            if args.rsu:
+                assemble_labels      = [rsu_label_one_hot]   + list(label_one_hot_list)
+                assemble_reg_target  = [rsu_reg_target]      + list(reg_target_list)
+                assemble_reg_mask    = [rsu_reg_loss_mask]   + list(reg_loss_mask_list)
+                assemble_anchors_map = [rsu_anchors_map]     + list(anchors_map_list)
+                assemble_vis_maps    = [rsu_vis_maps]        + list(vis_maps_list)
+            else:
+                assemble_labels      = label_one_hot_list
+                assemble_reg_target  = reg_target_list
+                assemble_reg_mask    = reg_loss_mask_list
+                assemble_anchors_map = anchors_map_list
+                assemble_vis_maps    = vis_maps_list
+
+            # Fuse selected vehicles' individual BEVs into the reference frame.
+            # trans_sel carries a (4,4) matrix per vehicle: vehicle_j → reference frame.
+            data = assemble_detection_inputs(
+                config,
+                padded_voxel_point_list,
+                padded_voxel_points_teacher_list,
+                assemble_labels,
+                assemble_reg_target,
+                assemble_reg_mask,
+                assemble_anchors_map,
+                assemble_vis_maps,
+                target_agent_id_list,
+                num_agent_list,
+                trans_sel,
+                device,
+            )
+
+            trans_matrices = data["trans_matrices"]
+            num_all_agents = data["num_agent"]
+            padded_voxel_points = data["bev_seq"]
+            label_one_hot = data["labels"]
+            reg_target = data["reg_targets"]
+            anchors_map = data["anchors"]
+            filename0 = filenames[0]
+        else:
+            filename0 = filenames[0]
+            trans_matrices = torch.stack(tuple(trans_matrices_list), 1)
+            target_agent_ids = torch.stack(tuple(target_agent_id_list), 1)
+            num_all_agents = torch.stack(tuple(num_agent_list), 1)
+
+            # add pose noise
+            if pose_noise > 0:
+                apply_pose_noise(pose_noise, trans_matrices)
+
+            if not args.rsu:
+                num_all_agents -= 1
+
+            if flag == "upperbound":
+                padded_voxel_points = torch.cat(tuple(padded_voxel_points_teacher_list), 0)
+            else:
+                padded_voxel_points = torch.cat(tuple(padded_voxel_point_list), 0)
+
+            label_one_hot = torch.cat(tuple(label_one_hot_list), 0)
+            reg_target = torch.cat(tuple(reg_target_list), 0)
+            reg_loss_mask = torch.cat(tuple(reg_loss_mask_list), 0)
+            anchors_map = torch.cat(tuple(anchors_map_list), 0)
+            vis_maps = torch.cat(tuple(vis_maps_list), 0)
+
+            data = {
+                "bev_seq": padded_voxel_points.to(device),
+                "labels": label_one_hot.to(device),
+                "reg_targets": reg_target.to(device),
+                "anchors": anchors_map.to(device),
+                "vis_maps": vis_maps.to(device),
+                "reg_loss_mask": reg_loss_mask.to(device).type(dtype=torch.bool),
+                "target_agent_ids": target_agent_ids.to(device),
+                "num_agent": num_all_agents.to(device),
+                "trans_matrices": trans_matrices.to(device),
+            }
+            n_for_cost = len(agent_idx_range)
+            n_available = n_for_cost
+
+            _teacher_tensors = [
+                torch.as_tensor(t)
+                for t in padded_voxel_points_teacher_list
+                if t is not None and torch.as_tensor(t).numel() > 0
+            ]
+            if _teacher_tensors:
+                bev_size_bytes = bev_size_from_tensor(torch.stack(_teacher_tensors, dim=0))
+            else:
+                # lowerbound: no teacher BEVs; measure individual BEVs instead
+                _lb_tensors = [
+                    torch.as_tensor(t)
+                    for t in padded_voxel_point_list
+                    if t is not None and torch.as_tensor(t).numel() > 0
+                ]
+                bev_size_bytes = bev_size_from_tensor(torch.stack(_lb_tensors, dim=0)) if _lb_tensors else 0
+
+        if args.selection:
+            predict_out, inference_time_ms = _timed_forward(
+                device,
+                lambda: fafmodule.predict_all(data, 1, num_agent=1),
+            )
+            loss, cls_loss, loc_loss, result = predict_out
+        elif flag == "lowerbound_box_com":
+            predict_out, inference_time_ms = _timed_forward(
+                device,
+                lambda: fafmodule.predict_all_with_box_com(
+                    data, data["trans_matrices"]
+                ),
+            )
+            loss, cls_loss, loc_loss, result = predict_out
         elif flag == "disco":
-            (
-                loss,
-                cls_loss,
-                loc_loss,
-                result,
-                save_agent_weight_list,
-            ) = fafmodule.predict_all(data, 1, num_agent=num_agent)
-        else:
-            loss, cls_loss, loc_loss, result = fafmodule.predict_all(
-                data, 1, num_agent=num_agent
+            predict_out, inference_time_ms = _timed_forward(
+                device,
+                lambda: fafmodule.predict_all(data, 1, num_agent=num_agent),
             )
+            loss, cls_loss, loc_loss, result, save_agent_weight_list = predict_out
+        else:
+            predict_out, inference_time_ms = _timed_forward(
+                device,
+                lambda: fafmodule.predict_all(data, 1, num_agent=num_agent),
+            )
+            loss, cls_loss, loc_loss, result = predict_out
+
+        comm_cost = compute_cost(n_for_cost, cost_config, bev_size_bytes, inference_time_ms)
+        frame_cost_rows.append({
+            "scene_id": scene_id,
+            "frame_id": frame_id,
+            "flag": flag,
+            "sel_method": args.sel_method if args.selection else "all_agents",
+            "n_available": n_available,
+            "n_selected": n_for_cost,
+            "bandwidth_MB": comm_cost.bandwidth_MB,
+            "latency_upload_ms": comm_cost.latency_upload_ms,
+            "latency_proc_ms": comm_cost.latency_proc_ms,
+            "latency_total_ms": comm_cost.latency_total_ms,
+            "combined_cost": comm_cost.combined_cost,
+        })
 
         box_color_map = ["red", "yellow", "blue", "purple", "black", "orange"]
 
-        # If has RSU, do not count RSU's output into evaluation
-        eval_start_idx = 1 if args.rsu else 0
+        if args.selection:
+            eval_start_idx = 0
+            num_agent = 1
+        else:
+            eval_start_idx = 1 if args.rsu else 0
 
         # local qualitative evaluation
         for k in range(eval_start_idx, num_agent):
             box_colors = None
-            if apply_late_fusion == 1 and len(result[k]) != 0:
+            # Late fusion is not applicable in selection mode: BEVs have already
+            # been fused at the data level before the detector runs.
+            run_late_fusion = apply_late_fusion == 1 and not args.selection
+            if run_late_fusion and len(result[k]) != 0:
                 pred_restore = result[k][0][0][0]["pred"]
                 score_restore = result[k][0][0][0]["score"]
                 selected_idx_restore = result[k][0][0][0]["selected_idx"]
@@ -364,7 +557,11 @@ def main(args):
                 "reg_targets": torch.unsqueeze(reg_target[k, :, :, :, :, :], 0),
                 "anchors": torch.unsqueeze(anchors_map[k, :, :, :, :], 0),
             }
-            temp = gt_max_iou[k]
+            # RSU-centric: evaluate against RSU GT boxes, not the selected vehicle's GT.
+            if args.rsu and args.selection:
+                temp = rsu_gt_max_iou
+            else:
+                temp = gt_max_iou[k]
 
             if len(temp[0]["gt_box"]) == 0:
                 data_agents["gt_max_iou"] = []
@@ -372,7 +569,7 @@ def main(args):
                 data_agents["gt_max_iou"] = temp[0]["gt_box"][0, :, :]
 
             # late fusion
-            if apply_late_fusion == 1 and len(result[k]) != 0:
+            if run_late_fusion and len(result[k]) != 0:
                 box_colors = late_fusion(
                     k, num_agent, result, trans_matrices, box_color_map
                 )
@@ -457,13 +654,22 @@ def main(args):
                 det_file.close()
 
             # restore data before late-fusion
-            if apply_late_fusion == 1 and len(result[k]) != 0:
+            if run_late_fusion and len(result[k]) != 0:
                 result[k][0][0][0]["pred"] = pred_restore
                 result[k][0][0][0]["score"] = score_restore
                 result[k][0][0][0]["selected_idx"] = selected_idx_restore
 
         print("Validation scene {}, at frame {}".format(seq_name, idx))
+        print("Communication cost: {}".format(comm_cost))
         print("Takes {} s\n".format(str(time.time() - t)))
+        frames_processed += 1
+
+    if frames_processed == 0:
+        raise RuntimeError(
+            "No frames were evaluated. Check --scene_begin/--scene_end against "
+            "scenes present in --data_prep (test split commonly uses scenes "
+            "such as 5, 8, and 19)."
+        )
 
     logger_root = args.logpath if args.logpath != "" else "logs"
     logger_root = os.path.join(
@@ -548,6 +754,47 @@ def main(args):
             mean_ap_local[-2], mean_ap_local[-1]
         )
     )
+
+    # ------------------------------------------------------------------
+    # CSV output
+    # ------------------------------------------------------------------
+    csv_dir = args.csv_path if args.csv_path else logger_root
+
+    # Per-frame cost CSV
+    frame_csv_path = os.path.join(csv_dir, "frame_costs.csv")
+    if frame_cost_rows:
+        frame_fieldnames = list(frame_cost_rows[0].keys())
+        with open(frame_csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=frame_fieldnames)
+            writer.writeheader()
+            writer.writerows(frame_cost_rows)
+        print_and_write_log(f"Per-frame cost CSV saved to {frame_csv_path}")
+
+    # Summary CSV
+    summary_csv_path = os.path.join(csv_dir, "summary.csv")
+    avg_bandwidth = sum(r["bandwidth_MB"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
+    avg_latency = sum(r["latency_total_ms"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
+    avg_cost = sum(r["combined_cost"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
+    summary_row = {
+        "flag": flag,
+        "sel_method": args.sel_method if args.selection else "all_agents",
+        "rsu": args.rsu,
+        "scene_begin": args.scene_begin,
+        "scene_end": args.scene_end,
+        "n_frames": frames_processed,
+        "mAP_05": mean_ap_local[-2],
+        "mAP_07": mean_ap_local[-1],
+        "avg_bandwidth_MB": avg_bandwidth,
+        "avg_latency_ms": avg_latency,
+        "avg_combined_cost": avg_cost,
+    }
+    write_header = not os.path.exists(summary_csv_path)
+    with open(summary_csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary_row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(summary_row)
+    print_and_write_log(f"Summary CSV saved/appended to {summary_csv_path}")
 
     if need_log:
         saver.close()
@@ -667,6 +914,11 @@ if __name__ == "__main__":
         help="The end index of scenes to be evaluated",
     )
     parser.add_argument(
+        "--selection",
+        action="store_true",
+        help="Whether to perform agent selection",
+    )
+    parser.add_argument(
         "--sel_method",
         default="identity",
         type=str,
@@ -677,6 +929,13 @@ if __name__ == "__main__":
         default=None,
         type=str,
         help="Path to the trained agent selection model",
+    )
+    parser.add_argument(
+        "--csv_path",
+        default="",
+        type=str,
+        help="Directory to write CSV outputs (frame_costs.csv, summary.csv). "
+             "Defaults to the same directory as log_test.txt.",
     )
 
     torch.multiprocessing.set_sharing_strategy("file_system")

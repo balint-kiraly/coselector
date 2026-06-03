@@ -1,3 +1,5 @@
 /created_data/
 /logs/
 /checkpoints/
+*/__pycache__/*
+__pycache__/*

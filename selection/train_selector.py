@@ -21,6 +21,7 @@ from coperception.utils.CoDetModule import FaFModule
 from coperception.utils.loss import SoftmaxFocalClassificationLoss, WeightedSmoothL1LocalizationLoss
 from data_utils.build_state_features import build_state_features
 from data_utils.state_index import StateIndex
+from selection.bev_builder import assemble_detection_inputs
 from selection.models import AgentSelectorMLP
 
 from coperception.datasets import V2XSimDet
@@ -108,7 +109,7 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=1,
-        shuffle=True,
+        shuffle=True, # can be set to True later
         num_workers=args.num_workers
     )
     print(f"Train dataset size: {len(train_dataset)} samples.")
@@ -249,7 +250,8 @@ def main():
             actions = m.sample()                     # (N,)
             log_probs = m.log_prob(actions)          # (N,)
 
-            selected_indices = actions.nonzero(as_tuple=True)[0].cpu().tolist()
+            #selected_indices = actions.nonzero(as_tuple=True)[0].cpu().tolist()
+            selected_indices = [i for i in range(len(actions))] # temporary: select all agents
             num_selected = len(selected_indices)
             selected_agent_ids = [available_agent_ids[i] for i in selected_indices]
             det_loss_value = None
@@ -270,29 +272,22 @@ def main():
                 num_agent_list_sel = _sel(num_agent_list)
                 trans_mats_list_sel = _sel(trans_matrices_list)
 
-                trans_matrices = torch.stack(tuple(trans_mats_list_sel), 1).to(device)
-                target_agent_ids = torch.stack(tuple(target_agent_id_list_sel), 1).to(device)
-                num_all_agents = torch.tensor([[num_selected]], dtype=torch.int64, device=device)
-
-                # choose teacher or normal bev (here just use normal)
-                padded_voxel_points = torch.cat(tuple(pvp_teacher_list_sel), 0).to(device)
-                label_one_hot = torch.cat(tuple(label_list_sel), 0).to(device)
-                reg_target = torch.cat(tuple(reg_target_list_sel), 0).to(device)
-                reg_loss_mask = torch.cat(tuple(reg_loss_mask_list_sel), 0).to(device)
-                anchors_map = torch.cat(tuple(anchors_list_sel), 0).to(device)
-                vis_maps = torch.cat(tuple(vis_maps_list_sel), 0).to(device)
-
-                data = {
-                    "bev_seq": padded_voxel_points,
-                    "labels": label_one_hot,
-                    "reg_targets": reg_target,
-                    "anchors": anchors_map,
-                    "vis_maps": vis_maps,
-                    "reg_loss_mask": reg_loss_mask.bool(),
-                    "target_agent_ids": target_agent_ids,
-                    "num_agent": num_all_agents,
-                    "trans_matrices": trans_matrices,
-                }
+                # Fuse the post-selection agents using the same alignment and voxelization
+                # used by create_data_det so detector inputs only contain chosen data.
+                data = assemble_detection_inputs(
+                    config,
+                    pvp_list_sel,
+                    pvp_teacher_list_sel,
+                    label_list_sel,
+                    reg_target_list_sel,
+                    reg_loss_mask_list_sel,
+                    anchors_list_sel,
+                    vis_maps_list_sel,
+                    target_agent_id_list_sel,
+                    num_agent_list_sel,
+                    trans_mats_list_sel,
+                    device,
+                )
 
                 # --- run detection model (frozen) ---
                 with torch.no_grad():
