@@ -268,6 +268,9 @@ def main(args):
     cost_config = CostConfig.from_scenario(CostScenario.BALANCED)
     frame_cost_rows: list = []
     n_available = 0
+    # per-scene accumulators: scene_id -> list of n_selected values
+    scene_selected: dict = {}
+    scene_available: dict = {}
 
     for cnt, sample in enumerate(validation_data_loader):
         t = time.time()
@@ -313,6 +316,11 @@ def main(args):
                 agent_id: idx for idx, agent_id in enumerate(agent_idx_range)
             }
 
+            # Extract transform table early so it's available for selection policies
+            # that need agent positions (closest_k, heuristic, bandwidth_aware).
+            # Slot [0, j] = T_{agent_j → reference_frame}.
+            _ref_table = torch.as_tensor(trans_matrices_list[0])  # (1, N, 4, 4)
+
             # ------------------ Agent Selection Model ------------------
             if args.selection and args.sel_method == "ml_model" and cnt == 0:
                 sel_model = AgentSelectorMLP(input_dim=state_feats.shape[1])
@@ -327,6 +335,10 @@ def main(args):
                 state_feats,
                 method=SelectionMethod(args.sel_method),
                 model=sel_model,
+                K=args.K,
+                budget_bytes=int(args.budget_mb * 1024 * 1024),
+                rsu_trans=_ref_table[0],   # (N_agents, 4, 4)
+                metas=metas,
             )
             selected_indices = [
                 agent_id_to_idx[metas[i].agent_id]
@@ -359,12 +371,6 @@ def main(args):
             else:
                 rsu_gt_max_iou = None
 
-            # Extract per-agent (4,4) transform matrices from the reference agent's
-            # perspective table BEFORE _sel() modifies trans_matrices_list.
-            # With --rsu 1: trans_matrices_list[0] = RSU's perspective table (1,6,4,4).
-            # With --rsu 0: trans_matrices_list[0] = agent 1's table (1,5,4,4).
-            # Slot [0, j] = transform from agent j's frame INTO the reference frame.
-            _ref_table = torch.as_tensor(trans_matrices_list[0])  # (1, N, 4, 4)
             trans_sel = [_ref_table[0, j] for j in selected_indices]  # list of (4,4)
 
             def _sel(lst):
@@ -532,6 +538,9 @@ def main(args):
             "latency_total_ms": comm_cost.latency_total_ms,
             "combined_cost": comm_cost.combined_cost,
         })
+        # accumulate per-scene stats
+        scene_selected.setdefault(scene_id, []).append(n_for_cost)
+        scene_available.setdefault(scene_id, []).append(n_available)
 
         box_color_map = ["red", "yellow", "blue", "purple", "black", "orange"]
 
@@ -760,6 +769,12 @@ def main(args):
     # ------------------------------------------------------------------
     csv_dir = args.csv_path if args.csv_path else logger_root
 
+    # Infer split name from data path  (…/V2X-Sim-det/val  →  "val")
+    _data_parts = os.path.normpath(args.data_prep).split(os.sep)
+    split_name = _data_parts[-1] if _data_parts[-1] in ("train", "val", "test") else "unknown"
+
+    sel_method_label = args.sel_method if args.selection else "all_agents"
+
     # Per-frame cost CSV
     frame_csv_path = os.path.join(csv_dir, "frame_costs.csv")
     if frame_cost_rows:
@@ -770,20 +785,49 @@ def main(args):
             writer.writerows(frame_cost_rows)
         print_and_write_log(f"Per-frame cost CSV saved to {frame_csv_path}")
 
-    # Summary CSV
+    # Per-scene CSV
+    scene_csv_path = os.path.join(csv_dir, "scene_stats.csv")
+    scene_rows = []
+    for sid in sorted(scene_selected.keys()):
+        sel_vals = scene_selected[sid]
+        avail_vals = scene_available[sid]
+        scene_rows.append({
+            "scene_id": sid,
+            "split": split_name,
+            "sel_method": sel_method_label,
+            "K": args.K,
+            "budget_mb": args.budget_mb,
+            "n_frames": len(sel_vals),
+            "avg_n_available": sum(avail_vals) / max(1, len(avail_vals)),
+            "avg_n_selected": sum(sel_vals) / max(1, len(sel_vals)),
+        })
+    if scene_rows:
+        write_header = not os.path.exists(scene_csv_path)
+        with open(scene_csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(scene_rows[0].keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerows(scene_rows)
+        print_and_write_log(f"Per-scene stats CSV saved/appended to {scene_csv_path}")
+
+    # Summary CSV (one row per run, appends for easy comparison across strategies)
     summary_csv_path = os.path.join(csv_dir, "summary.csv")
     avg_bandwidth = sum(r["bandwidth_MB"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
     avg_latency = sum(r["latency_total_ms"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
     avg_cost = sum(r["combined_cost"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
+    all_n_selected = [r["n_selected"] for r in frame_cost_rows]
     summary_row = {
         "flag": flag,
-        "sel_method": args.sel_method if args.selection else "all_agents",
+        "split": split_name,
+        "sel_method": sel_method_label,
+        "K": args.K,
+        "budget_mb": args.budget_mb,
         "rsu": args.rsu,
-        "scene_begin": args.scene_begin,
-        "scene_end": args.scene_end,
+        "total_scenes": len(scene_selected),
         "n_frames": frames_processed,
         "mAP_05": mean_ap_local[-2],
         "mAP_07": mean_ap_local[-1],
+        "avg_n_selected": sum(all_n_selected) / max(1, len(all_n_selected)),
         "avg_bandwidth_MB": avg_bandwidth,
         "avg_latency_ms": avg_latency,
         "avg_combined_cost": avg_cost,
@@ -922,7 +966,19 @@ if __name__ == "__main__":
         "--sel_method",
         default="identity",
         type=str,
-        help="Agent selection method: identity/ml_model/..."
+        help="Agent selection method: identity/closest_k/velocity/heuristic/bandwidth/ml_model",
+    )
+    parser.add_argument(
+        "--K",
+        default=3,
+        type=int,
+        help="Number of agents to select (used by closest_k, velocity, heuristic)",
+    )
+    parser.add_argument(
+        "--budget_mb",
+        default=2.0,
+        type=float,
+        help="Bandwidth budget in MB (used by bandwidth_aware strategy)",
     )
     parser.add_argument(
         "--sel_model_path",

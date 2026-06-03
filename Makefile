@@ -69,8 +69,12 @@ plot_agents:
 		--state_root $(create_state_data_save_path) \
 		--save_path $(create_state_data_save_path)/agent_counts.png
 
-# Selection method: identity | closest_k | heuristic | ml_model
+# Selection method: identity | closest_k | heuristic | velocity | bandwidth | ml_model
 sel_method := identity
+# K agents to select (closest_k / heuristic / velocity)
+K := 3
+# Bandwidth budget in MB (bandwidth strategy)
+budget_mb := 2.0
 # RSU: 0 = no RSU (agents 1-5), 1 = include RSU (agent 0)
 rsu := 0
 # Number of agents (including RSU slot 0); keep at 6 for V2X-Sim
@@ -88,7 +92,9 @@ test:
 	--rsu $(rsu) \
 	--num_agent $(num_agent) \
 	--selection \
-	--sel_method $(sel_method)
+	--sel_method $(sel_method) \
+	--K $(K) \
+	--budget_mb $(budget_mb)
 
 test_identity:
 	$(MAKE) test sel_method=identity
@@ -111,7 +117,9 @@ test_identity_rsu:
 	--rsu 1 \
 	--num_agent $(num_agent) \
 	--selection \
-	--sel_method $(sel_method)
+	--sel_method $(sel_method) \
+	--K $(K) \
+	--budget_mb $(budget_mb)
 
 # rsu_suffix: no_rsu or with_rsu — auto-selected based on rsu flag
 rsu_suffix := $(if $(filter 1,$(rsu)),with_rsu,no_rsu)

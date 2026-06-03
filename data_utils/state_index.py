@@ -167,7 +167,7 @@ class StateIndex:
     # Building the index
     # ----------------------------------------------------------
     def build_index(self):
-        nusc = NuScenes(version=self.nusc_version, dataroot=dataroot, verbose=True)
+        nusc = NuScenes(version=self.nusc_version, dataroot=self.dataroot, verbose=True)
 
         print("Loading index...")
 
