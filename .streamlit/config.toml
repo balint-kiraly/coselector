@@ -1,0 +1,7 @@
+[server]
+# Disable the file watcher so Streamlit never hot-reloads while a CUDA
+# kernel is in flight.  A hot-reload kills the Python process mid-GPU-op,
+# leaving the NVIDIA driver in a deadlocked state where every subsequent
+# call to ps / nvidia-smi hangs indefinitely.
+fileWatcherType = "none"
+runOnSave = false

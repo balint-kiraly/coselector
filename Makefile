@@ -1,3 +1,5 @@
+.PHONY: gui create_data inspect_sensor inspect_bev plot_agents test test_identity test_identity_rsu test_all_agents train_rsu_centric train_rsu_centric_smoke train_selector
+
 # Path to the original V2X-Sim dataset
 original_data_path := /mnt/10TB/balintkiraly/data/data/V2X-Sim-2
 # Where to save the created bev data
@@ -166,6 +168,17 @@ train_rsu_centric_smoke:
 	--lr         1e-4 \
 	--min_agents 2 \
 	--max_agents 3
+
+# ── GUI ──────────────────────────────────────────────────────────────────────
+# Interactive Streamlit GUI for scene/strategy exploration.
+# Runs on localhost:8501 by default.  Pass PORT=XXXX to override.
+PORT ?= 8501
+
+gui:
+	streamlit run gui/app.py \
+	--server.port $(PORT) \
+	--server.headless true \
+	--theme.base dark
 
 train_selector:
 	python -m selection.train_selector \
