@@ -100,6 +100,8 @@ test:
 	--sel_method $(sel_method) \
 	--K $(K) \
 	--budget_mb $(budget_mb) \
+	--scene_begin $(scene_begin) \
+	--scene_end $(scene_end) \
 	$(if $(filter-out 0,$(max_inference_ms)),--max_inference_ms $(max_inference_ms),)
 
 test_identity:
@@ -125,7 +127,9 @@ test_identity_rsu:
 	--selection \
 	--sel_method $(sel_method) \
 	--K $(K) \
-	--budget_mb $(budget_mb)
+	--budget_mb $(budget_mb) \
+	--scene_begin $(scene_begin) \
+	--scene_end $(scene_end)
 
 # rsu_suffix: no_rsu or with_rsu — auto-selected based on rsu flag
 rsu_suffix := $(if $(filter 1,$(rsu)),with_rsu,no_rsu)
