@@ -24,9 +24,9 @@ from coperception.utils.data_util import apply_pose_noise
 from data_utils.build_state_features import build_state_features
 from data_utils.cost_model import (
     CostConfig,
-    CostScenario,
-    bev_size_from_tensor,
+    MEASURED_LIDAR_SIZE_MB,
     compute_cost,
+    make_balanced_config, bev_size_from_tensor,
 )
 from data_utils.state_index import StateIndex
 from selection.bev_builder import assemble_detection_inputs
@@ -40,19 +40,49 @@ def check_folder(folder_path):
     return folder_path
 
 
+try:
+    from codecarbon import EmissionsTracker as _EmissionsTracker
+    _HAS_CODECARBON = True
+except ImportError:
+    _HAS_CODECARBON = False
+
+
+def _tracker_energy_J(tracker) -> float:
+    """Extract joules from an EmissionsTracker (handles codecarbon 1.x and 2.x)."""
+    if hasattr(tracker, "final_emissions_data") and tracker.final_emissions_data is not None:
+        energy_kwh = tracker.final_emissions_data.energy_consumed
+    elif hasattr(tracker, "_total_energy"):
+        energy_kwh = tracker._total_energy.kwh
+    else:
+        return 0.0
+    return energy_kwh * 3_600_000
+
+
 def _sync_device(device):
     if device.type == "cuda":
         torch.cuda.synchronize()
 
 
 def _timed_forward(device, forward_fn):
-    """Run ``forward_fn`` and return ``(result, inference_time_ms)`` with GPU sync."""
+    """Run ``forward_fn`` and return ``(result, inference_time_ms, inference_energy_J)``.
+
+    Energy is measured via codecarbon (RAPL CPU + pynvml GPU + DRAM).
+    A fresh tracker is created per call so energy is scoped to this inference only.
+    """
     _sync_device(device)
+    if _HAS_CODECARBON:
+        _tracker = _EmissionsTracker(save_to_file=False, measure_power_secs=1)
+        _tracker.start()
     t0 = time.perf_counter()
     result = forward_fn()
     _sync_device(device)
     inference_time_ms = (time.perf_counter() - t0) * 1000.0
-    return result, inference_time_ms
+    if _HAS_CODECARBON:
+        _tracker.stop()
+        inference_energy_J = _tracker_energy_J(_tracker)
+    else:
+        inference_energy_J = 0.0
+    return result, inference_time_ms, inference_energy_J
 
 
 @torch.no_grad()
@@ -265,7 +295,36 @@ def main(args):
     sel_model = None
     eval_start_idx = 1 if args.rsu else 0
     frames_processed = 0
-    cost_config = CostConfig.from_scenario(CostScenario.BALANCED)
+    measurements_dir = args.measurements_dir if args.measurements_dir else None
+    try:
+        cost_config = make_balanced_config(
+            link_rate_Mbps=args.link_rate_mbps,
+            measurements_dir=measurements_dir,
+        )
+        if measurements_dir:
+            print(f"Loaded cost constants from {measurements_dir}")
+    except FileNotFoundError as e:
+        print(f"WARNING: {e}\nFalling back to default lidar_size_MB={MEASURED_LIDAR_SIZE_MB}")
+        cost_config = make_balanced_config(link_rate_Mbps=args.link_rate_mbps)
+    # ── Normalisation denominators ─────────────────────────────────────────
+    # Prefer: --max_inference_ms (from a previous identity baseline run)
+    # Then:   measurements/precomp_cost.json "inference_norm_ms" field
+    # Else:   norms remain 0 → combined_cost is bandwidth-only (with a warning)
+    if args.max_inference_ms and args.max_inference_ms > 0:
+        cost_config.compute_normalization_constants(
+            ref_inference_ms=args.max_inference_ms,
+            ref_inference_energy_J=args.max_inference_energy_J if args.max_inference_energy_J > 0 else None,
+        )
+        print(f"Cost norms set from CLI: inference_norm_ms={args.max_inference_ms:.1f} ms")
+    elif cost_config.norms_calibrated:
+        print(f"Cost norms loaded from measurements: inference_norm_ms={cost_config.inference_norm_ms:.1f} ms")
+    else:
+        print(
+            "WARNING: --max_inference_ms not set and measurements/precomp_cost.json "
+            "has no 'inference_norm_ms'. Latency and energy terms will be 0 in "
+            "combined_cost. Run identity baseline first, then pass "
+            "--max_inference_ms=<avg_inference_ms from summary.csv>."
+        )
     frame_cost_rows: list = []
     n_available = 0
     # per-scene accumulators: scene_id -> list of n_selected values
@@ -346,10 +405,26 @@ def main(args):
                 if metas[i].agent_id in agent_id_to_idx
             ]
             if not selected_indices:
+                # No agents selected (e.g. bandwidth budget too tight for even one agent).
+                # Record a zero-cost frame — no bandwidth spent, no inference, no detections.
                 print(
-                    f"Skipping scene {scene_id} frame {frame_id}: "
-                    "no selected agents match detection dataloader indices"
+                    f"scene {scene_id} frame {frame_id}: "
+                    "0 agents selected — recording zero-cost frame, skipping inference."
                 )
+                zero_cost = compute_cost(0, 0.0, 0.0, cost_config)
+                frame_cost_rows.append({
+                    "scene_id": scene_id, "frame_id": frame_id,
+                    "flag": flag,
+                    "sel_method": args.sel_method if args.selection else "all_agents",
+                    "n_available": n_available, "n_selected": 0,
+                    "bandwidth_MB": 0.0, "upload_ms": 0.0, "precomp_ms": 0.0,
+                    "inference_ms": 0.0, "latency_total_ms": 0.0,
+                    "precomp_energy_J": 0.0, "inference_energy_J": 0.0,
+                    "total_energy_J": 0.0, "combined_cost": 0.0,
+                })
+                scene_selected.setdefault(scene_id, []).append(0)
+                scene_available.setdefault(scene_id, []).append(n_available)
+                frames_processed += 1
                 continue
 
             selected_num_agents = len(selected_indices)
@@ -498,13 +573,13 @@ def main(args):
                 bev_size_bytes = bev_size_from_tensor(torch.stack(_lb_tensors, dim=0)) if _lb_tensors else 0
 
         if args.selection:
-            predict_out, inference_time_ms = _timed_forward(
+            predict_out, inference_time_ms, inference_energy_J = _timed_forward(
                 device,
                 lambda: fafmodule.predict_all(data, 1, num_agent=1),
             )
             loss, cls_loss, loc_loss, result = predict_out
         elif flag == "lowerbound_box_com":
-            predict_out, inference_time_ms = _timed_forward(
+            predict_out, inference_time_ms, inference_energy_J = _timed_forward(
                 device,
                 lambda: fafmodule.predict_all_with_box_com(
                     data, data["trans_matrices"]
@@ -512,19 +587,19 @@ def main(args):
             )
             loss, cls_loss, loc_loss, result = predict_out
         elif flag == "disco":
-            predict_out, inference_time_ms = _timed_forward(
+            predict_out, inference_time_ms, inference_energy_J = _timed_forward(
                 device,
                 lambda: fafmodule.predict_all(data, 1, num_agent=num_agent),
             )
             loss, cls_loss, loc_loss, result, save_agent_weight_list = predict_out
         else:
-            predict_out, inference_time_ms = _timed_forward(
+            predict_out, inference_time_ms, inference_energy_J = _timed_forward(
                 device,
                 lambda: fafmodule.predict_all(data, 1, num_agent=num_agent),
             )
             loss, cls_loss, loc_loss, result = predict_out
 
-        comm_cost = compute_cost(n_for_cost, cost_config, bev_size_bytes, inference_time_ms)
+        comm_cost = compute_cost(n_for_cost, inference_time_ms, inference_energy_J, cost_config)
         frame_cost_rows.append({
             "scene_id": scene_id,
             "frame_id": frame_id,
@@ -533,9 +608,13 @@ def main(args):
             "n_available": n_available,
             "n_selected": n_for_cost,
             "bandwidth_MB": comm_cost.bandwidth_MB,
-            "latency_upload_ms": comm_cost.latency_upload_ms,
-            "latency_proc_ms": comm_cost.latency_proc_ms,
+            "upload_ms": comm_cost.upload_ms,
+            "precomp_ms": comm_cost.precomp_ms,
+            "inference_ms": comm_cost.inference_ms,
             "latency_total_ms": comm_cost.latency_total_ms,
+            "precomp_energy_J": comm_cost.precomp_energy_J,
+            "inference_energy_J": comm_cost.inference_energy_J,
+            "total_energy_J": comm_cost.total_energy_J,
             "combined_cost": comm_cost.combined_cost,
         })
         # accumulate per-scene stats
@@ -680,7 +759,7 @@ def main(args):
             "such as 5, 8, and 19)."
         )
 
-    logger_root = args.logpath if args.logpath != "" else "logs"
+    logger_root = args.logpath if args.logpath != "" else "/mnt/10TB/balintkiraly/results"
     logger_root = os.path.join(
         logger_root, f"{flag}_eval", "with_rsu" if args.rsu else "no_rsu"
     )
@@ -812,9 +891,9 @@ def main(args):
 
     # Summary CSV (one row per run, appends for easy comparison across strategies)
     summary_csv_path = os.path.join(csv_dir, "summary.csv")
-    avg_bandwidth = sum(r["bandwidth_MB"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
-    avg_latency = sum(r["latency_total_ms"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
-    avg_cost = sum(r["combined_cost"] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
+    def _avg(key):
+        return sum(r[key] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
+
     all_n_selected = [r["n_selected"] for r in frame_cost_rows]
     summary_row = {
         "flag": flag,
@@ -822,15 +901,22 @@ def main(args):
         "sel_method": sel_method_label,
         "K": args.K,
         "budget_mb": args.budget_mb,
+        "link_rate_mbps": args.link_rate_mbps,
         "rsu": args.rsu,
         "total_scenes": len(scene_selected),
         "n_frames": frames_processed,
         "mAP_05": mean_ap_local[-2],
         "mAP_07": mean_ap_local[-1],
         "avg_n_selected": sum(all_n_selected) / max(1, len(all_n_selected)),
-        "avg_bandwidth_MB": avg_bandwidth,
-        "avg_latency_ms": avg_latency,
-        "avg_combined_cost": avg_cost,
+        "avg_bandwidth_MB": _avg("bandwidth_MB"),
+        "avg_upload_ms": _avg("upload_ms"),
+        "avg_precomp_ms": _avg("precomp_ms"),
+        "avg_inference_ms": _avg("inference_ms"),
+        "avg_latency_total_ms": _avg("latency_total_ms"),
+        "avg_precomp_energy_J": _avg("precomp_energy_J"),
+        "avg_inference_energy_J": _avg("inference_energy_J"),
+        "avg_total_energy_J": _avg("total_energy_J"),
+        "avg_combined_cost": _avg("combined_cost"),
     }
     write_header = not os.path.exists(summary_csv_path)
     with open(summary_csv_path, "a", newline="") as f:
@@ -992,6 +1078,36 @@ if __name__ == "__main__":
         type=str,
         help="Directory to write CSV outputs (frame_costs.csv, summary.csv). "
              "Defaults to the same directory as log_test.txt.",
+    )
+    parser.add_argument(
+        "--link_rate_mbps",
+        default=10.0,
+        type=float,
+        help="Simulated uplink bandwidth in Mbps for upload latency model (default: 10.0)",
+    )
+    parser.add_argument(
+        "--measurements_dir",
+        default="measurements",
+        type=str,
+        help="Directory containing lidar_size.json and precomp_cost.json from measurement tools. "
+             "If the files are missing, falls back to built-in defaults.",
+    )
+    parser.add_argument(
+        "--max_inference_ms",
+        default=0.0,
+        type=float,
+        help=(
+            "All-agents baseline inference latency in ms, used as the normalisation "
+            "denominator for combined_cost. Obtain from avg_inference_ms in "
+            "summary.csv after running: make test sel_method=identity. "
+            "If 0 (default), latency/energy terms are omitted from combined_cost."
+        ),
+    )
+    parser.add_argument(
+        "--max_inference_energy_J",
+        default=0.0,
+        type=float,
+        help="All-agents inference energy in J for combined_cost normalisation (optional).",
     )
 
     torch.multiprocessing.set_sharing_strategy("file_system")

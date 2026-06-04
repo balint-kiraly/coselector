@@ -79,6 +79,11 @@ budget_mb := 2.0
 rsu := 0
 # Number of agents (including RSU slot 0); keep at 6 for V2X-Sim
 num_agent := 6
+# Normalisation denominator for combined_cost latency/energy axes.
+# After running: make test sel_method=identity
+# read avg_inference_ms from logs/summary.csv and set this variable.
+# Leave at 0 to use bandwidth-only combined_cost.
+max_inference_ms := 0
 
 test:
 	python test_codet_selector.py \
@@ -94,7 +99,8 @@ test:
 	--selection \
 	--sel_method $(sel_method) \
 	--K $(K) \
-	--budget_mb $(budget_mb)
+	--budget_mb $(budget_mb) \
+	$(if $(filter-out 0,$(max_inference_ms)),--max_inference_ms $(max_inference_ms),)
 
 test_identity:
 	$(MAKE) test sel_method=identity
