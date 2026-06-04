@@ -23,7 +23,7 @@ from torch import optim
 from selection.bev_builder import assemble_detection_inputs
 
 DATA_TEST = '/mnt/10TB/balintkiraly/created_data/V2X-Sim-det/test'
-CKPT = '/home/bkiraly/coselector/checkpoints/upperbound/no_rsu/epoch_100.pth'
+CKPT = '/mnt/10TB/balintkiraly/checkpoints/upperbound/no_rsu/epoch_100.pth'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ---- load one sample ----

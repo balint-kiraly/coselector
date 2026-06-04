@@ -46,7 +46,7 @@ from selection.policy import select_agents_from_metadata, SelectionMethod
 DEFAULT_DATA_PATH  = "/mnt/10TB/balintkiraly/created_data/V2X-Sim-det/test"
 DEFAULT_STATE_PATH = "/mnt/10TB/balintkiraly/created_data/V2X-Sim-States"
 DEFAULT_CKPT_PATH  = (
-    "/home/bkiraly/coperception/tools/det/checkpoints"
+    "/mnt/10TB/balintkiraly/checkpoints"
     "/upperbound/no_rsu/epoch_100.pth"
 )
 

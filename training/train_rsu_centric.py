@@ -39,8 +39,8 @@ Typical command
   python training/train_rsu_centric.py \\
       --data_train /mnt/10TB/balintkiraly/created_data/V2X-Sim-det/train \\
       --data_val   /mnt/10TB/balintkiraly/created_data/V2X-Sim-det/val \\
-      --resume     /home/bkiraly/coperception/tools/det/checkpoints/upperbound/no_rsu/epoch_100.pth \\
-      --logpath    /home/bkiraly/coselector/checkpoints/rsu_centric \\
+      --resume     /mnt/10TB/balintkiraly/checkpoints/upperbound/no_rsu/epoch_100.pth \\
+      --logpath    /mnt/10TB/balintkiraly/checkpoints/rsu_centric \\
       --nepoch     30  --batch_size 4  --patience 7 \\
       --min_agents 1   --max_agents 5  --amp
 """
@@ -331,7 +331,7 @@ if __name__ == "__main__":
     # ── checkpointing ─────────────────────────────────────────────────────────
     parser.add_argument("--resume",  default="",
                         help="Path to a .pth checkpoint to warm-start from")
-    parser.add_argument("--logpath", default="checkpoints/rsu_centric",
+    parser.add_argument("--logpath", default="/mnt/10TB/balintkiraly/checkpoints/rsu_centric",
                         help="Directory for saving checkpoints and logs")
 
     torch.multiprocessing.set_sharing_strategy("file_system")

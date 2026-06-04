@@ -55,7 +55,7 @@ def parse_args():
     p.add_argument("--reward_baseline_momentum", type=float, default=0.9)
 
     p.add_argument("--save_path", type=str, required=True,)
-    p.add_argument("--logs", type=str, default="logs",
+    p.add_argument("--logs", type=str, default="/mnt/10TB/balintkiraly/results",
                    help="Directory to save plots and frame-level selections.")
 
     return p.parse_args()

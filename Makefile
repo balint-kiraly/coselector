@@ -25,9 +25,9 @@ testing_data := $(create_bev_data_save_path)/val
 com := upperbound
 batch_size := 4
 # Where to load/save the checkpoints
-checkpoint_path := checkpoints
-# Where to store the logs
-log_path := logs
+checkpoint_path := /mnt/10TB/balintkiraly/checkpoints
+# Where to store the results / evaluation logs
+log_path := /mnt/10TB/balintkiraly/results
 # Train for how many epochs
 n_epoch := 100
 # 1: apply late fusion. 0: no late fusion
@@ -104,7 +104,7 @@ test_identity:
 # vehicle-frame Z so voxels survive the ~5.5 m height offset.  GT labels are 2D.
 # Uses upperbound/no_rsu checkpoint: trained on dense merged vehicle BEVs
 # (closest density match; no RSU lidar — correct for Option B).
-lb_checkpoint_path := /home/bkiraly/coperception/tools/det/checkpoints
+lb_checkpoint_path := /mnt/10TB/balintkiraly/checkpoints
 test_identity_rsu:
 	python test_codet_selector.py \
 	--data_prep $(testing_data) \
@@ -140,7 +140,7 @@ test_all_agents:
 # Warm-starts from upperbound/with_rsu (all-agents oracle) and fine-tunes on
 # random vehicle subsets merged in RSU frame. Produces a model robust to any k
 # selected agents.  Safe defaults: 30 epochs, early-stop patience=7, AMP on.
-rsu_ckpt_save := /home/bkiraly/coselector/checkpoints/rsu_centric
+rsu_ckpt_save := /mnt/10TB/balintkiraly/checkpoints/rsu_centric
 min_agents := 1
 max_agents := 5
 train_patience := 7

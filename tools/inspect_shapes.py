@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from torch import nn, optim
 
 DATA_TEST = '/mnt/10TB/balintkiraly/created_data/V2X-Sim-det/test'
-CKPT = '/home/bkiraly/coselector/checkpoints/upperbound/no_rsu/epoch_100.pth'
+CKPT = '/mnt/10TB/balintkiraly/checkpoints/upperbound/no_rsu/epoch_100.pth'
 
 config = Config('train', binary=True, only_det=True)
 config_global = ConfigGlobal('train', binary=True, only_det=True)
