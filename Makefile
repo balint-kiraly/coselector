@@ -36,14 +36,14 @@ apply_late_fusion := 1
 visualization := 0
 
 create_data:
-	python preprocess/bev_precompute.py \
+	CUDA_VISIBLE_DEVICES="" python -u preprocess/bev_precompute.py \
 		--root $(original_data_path) \
 		--scene_begin $(scene_begin) \
 		--scene_end $(scene_end) \
 		--save_path $(create_bev_data_save_path) \
 		$(if $(only_split),--only_split $(only_split),)
 
-	python -m preprocess.state_precompute \
+	CUDA_VISIBLE_DEVICES="" python -u -m preprocess.state_precompute \
 		--root $(original_data_path) \
 		--scene_begin $(scene_begin) \
 		--scene_end $(scene_end) \

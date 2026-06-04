@@ -1,6 +1,8 @@
 import argparse
+import fcntl
 import json
 import math
+import multiprocessing
 import os
 import time
 
@@ -42,16 +44,24 @@ def _load_completed(save_path):
 
 
 def _mark_completed(save_path, agent_id, scene_id, completed):
-    """Add (agent_id, scene_id) to completed and persist atomically."""
-    key = f"agent_{agent_id}"
-    if key not in completed:
-        completed[key] = set()
-    completed[key].add(scene_id)
-
-    tmp = _completed_path(save_path) + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump({k: sorted(v) for k, v in completed.items()}, f, indent=2)
-    os.replace(tmp, _completed_path(save_path))
+    """Add (agent_id, scene_id) to completed and persist atomically.
+    Uses a lock file so parallel workers don't overwrite each other's updates.
+    """
+    lock_path = _completed_path(save_path) + ".lock"
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Re-read under lock so we don't lose another worker's concurrent write
+        fresh = _load_completed(save_path)
+        key = f"agent_{agent_id}"
+        if key not in fresh:
+            fresh[key] = set()
+        fresh[key].add(scene_id)
+        tmp = _completed_path(save_path) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({k: sorted(v) for k, v in fresh.items()}, f, indent=2)
+        os.replace(tmp, _completed_path(save_path))
+        # Propagate to caller's in-memory dict too
+        completed.update({k: set(v) for k, v in fresh.items()})
 
 
 def check_folder(folder_name):
@@ -423,8 +433,18 @@ def convert_to_dense_bev(seq_data_dict, config):
 
     visibility_maps = []
 
+    # Shape of each visibility map element: (map_dims[0], map_dims[1], map_dims[2])
+    _vis_shape = [config.map_dims[0], config.map_dims[1], config.map_dims[2]]
+
     if config.is_cross_road:
-        visibility_maps.append(np.zeros([256, 256, 13]))
+        visibility_maps.append(np.zeros(_vis_shape))
+    elif not config.use_vis:
+        # use_vis=False (default): visibility maps are never loaded during eval.
+        # Skip the C extension call entirely — it segfaults on certain scenes
+        # when point clouds fall outside grid extents (out-of-bounds array access
+        # in mapping.cpython-37m-x86_64-linux-gnu.so / compute_logodds_dp).
+        for idx in range(origins.shape[0]):
+            visibility_maps.append(np.zeros(_vis_shape))
     else:
         extents = config.area_extents
         for idx in range(origins.shape[0]):
@@ -448,7 +468,7 @@ def convert_to_dense_bev(seq_data_dict, config):
                     range(pts.shape[0]),
                     min(config.voxel_size),
                 )
-            )  # , lo_occupied, lo_free
+            )
 
     # Compile the batch of voxels, so that they can be fed into the network.
     # Note that, the padded_voxel_points in this script will only be used for sanity check.
@@ -643,6 +663,19 @@ def convert_to_sparse_bev(config, dense_bev_data, use_motion_state=False):
     return save_data_dict
 
 
+# Module-level worker so multiprocessing fork can resolve it by name.
+# Inherits coperception_dataset from the parent process via CoW fork.
+def _agent_worker(args):
+    agent, scene_idx, scene_splits, save_path, only_split = args
+    create_data(
+        coperception_dataset, agent,
+        scene_idx, scene_idx + 1,
+        scene_splits, save_path,
+        only_split=only_split,
+        completed=_load_completed(save_path),
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -686,6 +719,8 @@ if __name__ == "__main__":
         scene_begin = 0
         scene_end = 1
 
+    # Assign to module global so forked workers can access it without pickling
+    global coperception_dataset
     coperception_dataset = CoPerceptionDataset(version=dataset_version, dataroot=args.root, verbose=True)
     print("Total number of scenes:", len(coperception_dataset.scene))
 
@@ -705,5 +740,44 @@ if __name__ == "__main__":
         total_done = sum(len(v) for v in completed.values())
         print(f"Resuming: {total_done} (agent, scene) pairs already completed — will skip.")
 
-    for current_agent in range(args.from_agent, args.to_agent):
-        create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args.save_path, only_split=args.only_split, completed=completed)
+    # ── Scene-first loop with parallel agents ────────────────────────────────
+    # Outer loop: scenes — so each scene is fully finished before moving on.
+    # Inner pool: one worker per agent, all running in parallel for that scene.
+    # Workers inherit the dataset via fork (Linux CoW — no serialisation cost).
+
+    for scene_idx in range(scene_begin, scene_end):
+        # Determine split and apply only_split filter
+        split = None
+        for s in ['train', 'val', 'test']:
+            if scene_idx in scene_splits[s]:
+                split = s
+                break
+        if split is None:
+            print(f"Scene {scene_idx}: not found in any split, skipping.")
+            continue
+        if args.only_split and split != args.only_split:
+            continue
+
+        # Which agents still need processing?
+        agents_todo = [
+            a for a in range(args.from_agent, args.to_agent)
+            if scene_idx not in completed.get(f"agent_{a}", set())
+        ]
+        if not agents_todo:
+            print(f"Scene {scene_idx} ({split}): all agents done — skipping.")
+            continue
+
+        print(f"\n=== Scene {scene_idx} ({split}) — agents {agents_todo} ===")
+
+        # Pack args so pool.map receives a plain tuple (avoids closure capture issues)
+        worker_args = [
+            (agent, scene_idx, scene_splits, args.save_path, args.only_split)
+            for agent in agents_todo
+        ]
+
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(len(agents_todo)) as pool:
+            pool.map(_agent_worker, worker_args)
+
+        # Sync in-memory completed dict after all agents finish
+        completed = _load_completed(args.save_path)
