@@ -5,6 +5,35 @@ import os
 from coperception.utils.v2x_sim_scene_split.parser import parse_scene_files
 from data_utils.state_index import StateIndex
 
+
+# ── Completion tracking ───────────────────────────────────────────────────────
+# state_completed.json records scene ids that finished writing successfully.
+# Format: [0, 1, 5, ...]
+
+def _completed_path(save_path):
+    return os.path.join(save_path, "state_completed.json")
+
+
+def _load_completed(save_path):
+    """Return set of completed scene ids."""
+    path = _completed_path(save_path)
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def _mark_completed(save_path, scene_id, completed):
+    """Add scene_id to completed and persist atomically."""
+    completed.add(scene_id)
+    tmp = _completed_path(save_path) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sorted(completed), f, indent=2)
+    os.replace(tmp, _completed_path(save_path))
+
 def agent_meta_to_dict(am):
     return dict(
         scene_id=am.scene_id,
@@ -56,6 +85,11 @@ def main():
 
     os.makedirs(args.save_path, exist_ok=True)
 
+    # Load (or create) the completion tracker — reruns skip finished scenes
+    completed = _load_completed(args.save_path)
+    if completed:
+        print(f"Resuming: {len(completed)} scene(s) already completed — will skip.")
+
     # Resolve split filter
     only_split_scenes = None
     if args.only_split:
@@ -77,21 +111,35 @@ def main():
 
     state_index.build_index()
 
+    # Group frames by scene so we can skip / mark at scene granularity
+    scenes_to_frames = {}
     for (scene_id, frame_id), metas in state_index.frame_index.items():
         if only_split_scenes is not None and scene_id not in only_split_scenes:
             continue
+        scenes_to_frames.setdefault(scene_id, {})[frame_id] = metas
+
+    for scene_id in sorted(scenes_to_frames):
+        if scene_id in completed:
+            print(f"Scene {scene_id:03d} already completed — skipping.")
+            continue
+
+        print(f"Writing state data for scene {scene_id:03d} ...")
         scene_dir = os.path.join(args.save_path, f"scene_{scene_id:03d}")
         os.makedirs(scene_dir, exist_ok=True)
 
-        frame_dir = os.path.join(scene_dir, f"frame_{frame_id:03d}")
-        os.makedirs(frame_dir, exist_ok=True)
+        for frame_id, metas in sorted(scenes_to_frames[scene_id].items()):
+            frame_dir = os.path.join(scene_dir, f"frame_{frame_id:03d}")
+            os.makedirs(frame_dir, exist_ok=True)
 
-        for m in metas:
-            agent_path = os.path.join(frame_dir, f"agent_{m.agent_id:02d}.json")
-            data = agent_meta_to_dict(m)
+            for m in metas:
+                agent_path = os.path.join(frame_dir, f"agent_{m.agent_id:02d}.json")
+                data = agent_meta_to_dict(m)
+                with open(agent_path, "w") as f:
+                    json.dump(data, f, indent=2)
 
-            with open(agent_path, "w") as f:
-                json.dump(data, f, indent=2)
+        # All frames for this scene written — mark as complete
+        _mark_completed(args.save_path, scene_id, completed)
+        print(f"Scene {scene_id:03d} marked as completed.")
 
     print(f"Saved state index to {args.save_path}")
 

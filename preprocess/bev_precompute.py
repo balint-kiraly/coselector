@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import os
 import time
@@ -18,13 +19,53 @@ from coperception.utils.v2x_sim_scene_split.parser import parse_scene_files
 from nuscenes import NuScenes as CoPerceptionDataset
 
 
+# ── Completion tracking ───────────────────────────────────────────────────────
+# completed.json lives in save_path and records which (agent, scene) pairs
+# finished successfully so they are skipped on reruns.
+# Format: {"agent_0": [0, 1, 5, ...], "agent_1": [...], ...}
+
+def _completed_path(save_path):
+    return os.path.join(save_path, "bev_completed.json")
+
+
+def _load_completed(save_path):
+    """Return dict agent_str -> set of completed scene ids."""
+    path = _completed_path(save_path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            raw = json.load(f)
+        return {k: set(v) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _mark_completed(save_path, agent_id, scene_id, completed):
+    """Add (agent_id, scene_id) to completed and persist atomically."""
+    key = f"agent_{agent_id}"
+    if key not in completed:
+        completed[key] = set()
+    completed[key].add(scene_id)
+
+    tmp = _completed_path(save_path) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({k: sorted(v) for k, v in completed.items()}, f, indent=2)
+    os.replace(tmp, _completed_path(save_path))
+
+
 def check_folder(folder_name):
     os.makedirs(folder_name, exist_ok=True)
     return folder_name
 
 
 # ---------------------- Extract the scenes, and then pre-process them into BEV maps ----------------------
-def create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args_savepath, only_split=None):
+def create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args_savepath, only_split=None, completed=None):
+    """
+    Args:
+        completed: mutable dict returned by _load_completed().  Pass None to
+                   disable skip-on-rerun (useful for forced reruns).
+    """
     channel = "LIDAR_TOP_id_" + str(current_agent)
     total_sample = 0
     res_scenes = range(100)
@@ -48,6 +89,13 @@ def create_data(coperception_dataset, current_agent, scene_begin, scene_end, sce
         # Skip scenes that don't belong to the requested split
         if only_split and split != only_split:
             continue
+
+        # Skip scenes already completed on a previous run
+        if completed is not None:
+            key = f"agent_{current_agent}"
+            if scene_idx in completed.get(key, set()):
+                print(f"Scene {scene_idx} of agent {current_agent} already completed — skipping.")
+                continue
 
         savepath = os.path.join(args_savepath, split, "agent" + str(current_agent))
         os.makedirs(savepath, exist_ok=True)
@@ -307,6 +355,11 @@ def create_data(coperception_dataset, current_agent, scene_begin, scene_end, sce
 
             if flag:  # No more sample frames
                 break
+
+        # Scene finished successfully — record so reruns can skip it
+        if completed is not None:
+            _mark_completed(args_savepath, current_agent, scene_idx, completed)
+            print(f"Scene {scene_idx} of agent {current_agent} marked as completed.")
 
 
 # ----------------------------------------------------------------------------------------
@@ -645,5 +698,12 @@ if __name__ == "__main__":
     if args.only_split:
         print(f"Filtering: only processing '{args.only_split}' scenes.")
 
+    # Load (or create) the completion tracker once; shared across all agent calls
+    # so the JSON file is updated incrementally and reruns skip finished work.
+    completed = _load_completed(args.save_path)
+    if completed:
+        total_done = sum(len(v) for v in completed.values())
+        print(f"Resuming: {total_done} (agent, scene) pairs already completed — will skip.")
+
     for current_agent in range(args.from_agent, args.to_agent):
-        create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args.save_path, only_split=args.only_split)
+        create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args.save_path, only_split=args.only_split, completed=completed)

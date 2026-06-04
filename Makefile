@@ -9,7 +9,7 @@ create_state_data_save_path := /mnt/10TB/balintkiraly/created_data/V2X-Sim-State
 # Index of the beginning scene
 scene_begin := 0
  # Index of the ending scene + 1
-scene_end := 1 # max 100
+scene_end := 100 # max 100
 # Index of the start agent
 from_agent := 0
 # Index of the end agent + 1
@@ -79,12 +79,6 @@ budget_mb := 2.0
 rsu := 0
 # Number of agents (including RSU slot 0); keep at 6 for V2X-Sim
 num_agent := 6
-# Normalisation denominator for combined_cost latency/energy axes.
-# After running: make test sel_method=identity
-# read avg_inference_ms from logs/summary.csv and set this variable.
-# Leave at 0 to use bandwidth-only combined_cost.
-max_inference_ms := 0
-
 test:
 	python test_codet_selector.py \
 	--data_prep $(testing_data) \
@@ -101,8 +95,7 @@ test:
 	--K $(K) \
 	--budget_mb $(budget_mb) \
 	--scene_begin $(scene_begin) \
-	--scene_end $(scene_end) \
-	$(if $(filter-out 0,$(max_inference_ms)),--max_inference_ms $(max_inference_ms),)
+	--scene_end $(scene_end)
 
 test_identity:
 	$(MAKE) test sel_method=identity
