@@ -1,9 +1,11 @@
 import argparse
 import csv
+import json
 import os
 import sys
 import time
 from copy import deepcopy
+from datetime import datetime
 
 import seaborn as sns
 import torch
@@ -58,31 +60,43 @@ def _tracker_energy_J(tracker) -> float:
     return energy_kwh * 3_600_000
 
 
+def _start_run_tracker():
+    """Start ONE codecarbon tracker for the whole eval run.
+
+    IMPORTANT: never create a tracker per frame — EmissionsTracker.stop()
+    blocks for ~3 s (final measurement flush), which was adding 3 s/frame.
+    A single run-level tracker is started once and stopped once; per-frame
+    energy is derived afterwards by distributing the measured total across
+    frames in proportion to inference time.
+    """
+    if not _HAS_CODECARBON:
+        return None
+    try:
+        tracker = _EmissionsTracker(save_to_file=False, measure_power_secs=1)
+        tracker.start()
+        return tracker
+    except Exception as e:
+        print(f"WARNING: could not start codecarbon tracker ({e}); energy=0")
+        return None
+
+
 def _sync_device(device):
     if device.type == "cuda":
         torch.cuda.synchronize()
 
 
 def _timed_forward(device, forward_fn):
-    """Run ``forward_fn`` and return ``(result, inference_time_ms, inference_energy_J)``.
+    """Run ``forward_fn`` and return ``(result, inference_time_ms)`` with GPU sync.
 
-    Energy is measured via codecarbon (RAPL CPU + pynvml GPU + DRAM).
-    A fresh tracker is created per call so energy is scoped to this inference only.
+    Energy is NOT measured here (see _start_run_tracker): a per-call codecarbon
+    tracker costs ~3 s due to the blocking stop(). Time only — cheap and exact.
     """
     _sync_device(device)
-    if _HAS_CODECARBON:
-        _tracker = _EmissionsTracker(save_to_file=False, measure_power_secs=1)
-        _tracker.start()
     t0 = time.perf_counter()
     result = forward_fn()
     _sync_device(device)
     inference_time_ms = (time.perf_counter() - t0) * 1000.0
-    if _HAS_CODECARBON:
-        _tracker.stop()
-        inference_energy_J = _tracker_energy_J(_tracker)
-    else:
-        inference_energy_J = 0.0
-    return result, inference_time_ms, inference_energy_J
+    return result, inference_time_ms
 
 
 @torch.no_grad()
@@ -139,13 +153,46 @@ def main(args):
         kd_flag=args.kd_flag,
         rsu=args.rsu,
     )
-    validation_data_loader = DataLoader(
-        validation_dataset, batch_size=1, shuffle=False, num_workers=num_workers
-    )
-    print("Validation dataset size:", len(validation_dataset))
 
-    # ===== load state index =====
-    state_index = StateIndex.from_fs(args.state_path)
+    # ── Speedup 1: replace the multiprocessing.Manager() cache with plain dicts.
+    # V2XSimDet sets cache_size=0 for val (nothing is ever stored), but its
+    # `pick_single_agent` still does `if idx in self.cache[agent_id]` — a Manager
+    # proxy lookup that costs an IPC round-trip per agent per frame. Plain dicts
+    # make that check a free local lookup.
+    validation_dataset.cache = [{} for _ in range(validation_dataset.num_agent)]
+
+    # ── Speedup 2: filter to the requested scene range at the DATASET level.
+    # Previously every frame of all 10 val scenes was fully loaded from disk
+    # (sparse BEV → dense voxel grids for all agents) and only then discarded by
+    # the in-loop `scene_id out of range` check. Wrapping in a Subset means the
+    # dataloader never even touches out-of-range frames.
+    scene_of_idx = validation_dataset.seq_scenes[0]  # scene id per sample index
+    keep_indices = [
+        i for i, s in enumerate(scene_of_idx)
+        if args.scene_begin <= s < args.scene_end
+    ]
+    if not keep_indices:
+        raise RuntimeError(
+            f"No frames in scene range [{args.scene_begin}, {args.scene_end}). "
+            f"Scenes present: {sorted(set(scene_of_idx))}"
+        )
+    n_total_frames = len(scene_of_idx)
+    eval_dataset = torch.utils.data.Subset(validation_dataset, keep_indices)
+    print(
+        f"Scene filter: keeping {len(keep_indices)}/{n_total_frames} frames "
+        f"in scene range [{args.scene_begin}, {args.scene_end})"
+    )
+
+    validation_data_loader = DataLoader(
+        eval_dataset, batch_size=1, shuffle=False, num_workers=num_workers
+    )
+    print("Frames to evaluate:", len(eval_dataset))
+
+    # ===== load state index (only the scenes we will evaluate) =====
+    state_index = StateIndex.from_fs(
+        args.state_path,
+        scene_ids=range(args.scene_begin, args.scene_end),
+    )
 
     if not args.rsu:
         num_agent -= 1
@@ -307,29 +354,58 @@ def main(args):
         print(f"WARNING: {e}\nFalling back to default lidar_size_MB={MEASURED_LIDAR_SIZE_MB}")
         cost_config = make_balanced_config(link_rate_Mbps=args.link_rate_mbps)
     # ── Normalisation denominators ─────────────────────────────────────────
-    # Prefer: --max_inference_ms (from a previous identity baseline run)
-    # Then:   measurements/precomp_cost.json "inference_norm_ms" field
-    # Else:   norms remain 0 → combined_cost is bandwidth-only (with a warning)
+    # Keyed per model so different det models don't share the same denominator.
+    # Priority:
+    #   1. --max_inference_ms CLI (explicit override, any model)
+    #   2. measurements/inference_norms.json  key = "{com}_{no_rsu|with_rsu}"
+    #   3. combined_cost is bandwidth-only (with a warning)
+    #
+    # The identity run auto-writes to inference_norms.json so you never need
+    # to pass --max_inference_ms manually for models you've already baselined.
+    rsu_suffix = "with_rsu" if args.rsu else "no_rsu"
+    norm_key = f"{args.com}_{rsu_suffix}"
+    inference_norms_path = os.path.join(
+        args.measurements_dir or "measurements", "inference_norms.json"
+    )
+
+    def _load_inference_norms():
+        if os.path.isfile(inference_norms_path):
+            with open(inference_norms_path) as _f:
+                return json.load(_f)
+        return {}
+
     if args.max_inference_ms and args.max_inference_ms > 0:
         cost_config.compute_normalization_constants(
             ref_inference_ms=args.max_inference_ms,
             ref_inference_energy_J=args.max_inference_energy_J if args.max_inference_energy_J > 0 else None,
         )
-        print(f"Cost norms set from CLI: inference_norm_ms={args.max_inference_ms:.1f} ms")
-    elif cost_config.norms_calibrated:
-        print(f"Cost norms loaded from measurements: inference_norm_ms={cost_config.inference_norm_ms:.1f} ms")
+        print(f"Cost norms from CLI: {norm_key} → {args.max_inference_ms:.1f} ms")
     else:
-        print(
-            "WARNING: --max_inference_ms not set and measurements/precomp_cost.json "
-            "has no 'inference_norm_ms'. Latency and energy terms will be 0 in "
-            "combined_cost. Run identity baseline first, then pass "
-            "--max_inference_ms=<avg_inference_ms from summary.csv>."
-        )
+        _norms = _load_inference_norms()
+        if norm_key in _norms:
+            _entry = _norms[norm_key]
+            cost_config.compute_normalization_constants(
+                ref_inference_ms=_entry["avg_inference_ms"],
+                ref_inference_energy_J=_entry.get("avg_inference_energy_J", 0.0) or None,
+            )
+            print(f"Cost norms from inference_norms.json: {norm_key} → {_entry['avg_inference_ms']:.1f} ms")
+        elif cost_config.norms_calibrated:
+            print(f"Cost norms from measurements: inference_norm_ms={cost_config.inference_norm_ms:.1f} ms")
+        else:
+            print(
+                f"WARNING: no norm found for '{norm_key}' in {inference_norms_path}. "
+                "Run: make test sel_method=identity  to populate it automatically. "
+                "Until then, combined_cost is bandwidth-only."
+            )
     frame_cost_rows: list = []
     n_available = 0
     # per-scene accumulators: scene_id -> list of n_selected values
     scene_selected: dict = {}
     scene_available: dict = {}
+
+    # ONE energy tracker for the whole run (per-frame trackers cost ~3 s each).
+    run_tracker = _start_run_tracker()
+    run_wall_t0 = time.time()
 
     for cnt, sample in enumerate(validation_data_loader):
         t = time.time()
@@ -573,13 +649,13 @@ def main(args):
                 bev_size_bytes = bev_size_from_tensor(torch.stack(_lb_tensors, dim=0)) if _lb_tensors else 0
 
         if args.selection:
-            predict_out, inference_time_ms, inference_energy_J = _timed_forward(
+            predict_out, inference_time_ms = _timed_forward(
                 device,
                 lambda: fafmodule.predict_all(data, 1, num_agent=1),
             )
             loss, cls_loss, loc_loss, result = predict_out
         elif flag == "lowerbound_box_com":
-            predict_out, inference_time_ms, inference_energy_J = _timed_forward(
+            predict_out, inference_time_ms = _timed_forward(
                 device,
                 lambda: fafmodule.predict_all_with_box_com(
                     data, data["trans_matrices"]
@@ -587,19 +663,22 @@ def main(args):
             )
             loss, cls_loss, loc_loss, result = predict_out
         elif flag == "disco":
-            predict_out, inference_time_ms, inference_energy_J = _timed_forward(
+            predict_out, inference_time_ms = _timed_forward(
                 device,
                 lambda: fafmodule.predict_all(data, 1, num_agent=num_agent),
             )
             loss, cls_loss, loc_loss, result, save_agent_weight_list = predict_out
         else:
-            predict_out, inference_time_ms, inference_energy_J = _timed_forward(
+            predict_out, inference_time_ms = _timed_forward(
                 device,
                 lambda: fafmodule.predict_all(data, 1, num_agent=num_agent),
             )
             loss, cls_loss, loc_loss, result = predict_out
 
-        comm_cost = compute_cost(n_for_cost, inference_time_ms, inference_energy_J, cost_config)
+        # Energy is filled in after the loop (distributed from the run-level
+        # tracker total). Use 0 here — combined_cost depends on energy only when
+        # alpha_energy > 0, and the post-loop pass recomputes it then.
+        comm_cost = compute_cost(n_for_cost, inference_time_ms, 0.0, cost_config)
         frame_cost_rows.append({
             "scene_id": scene_id,
             "frame_id": frame_id,
@@ -752,6 +831,33 @@ def main(args):
         print("Takes {} s\n".format(str(time.time() - t)))
         frames_processed += 1
 
+    # ── Stop run tracker and distribute measured energy across frames ─────────
+    # codecarbon measures the whole run (data loading + assemble + inference).
+    # We attribute per-frame inference energy proportionally to inference time,
+    # so the per-frame numbers sum exactly to the measured run total.
+    run_wall_s = time.time() - run_wall_t0
+    total_run_energy_J = 0.0
+    if run_tracker is not None:
+        try:
+            run_tracker.stop()   # ~3 s, but ONCE for the whole run
+            total_run_energy_J = _tracker_energy_J(run_tracker)
+        except Exception as e:
+            print(f"WARNING: codecarbon stop failed ({e}); energy=0")
+
+    total_inf_ms = sum(r["inference_ms"] for r in frame_cost_rows) or 1.0
+    for r in frame_cost_rows:
+        share = r["inference_ms"] / total_inf_ms
+        inf_energy = total_run_energy_J * share
+        # recompute the energy + combined cost with the distributed value
+        cc = compute_cost(r["n_selected"], r["inference_ms"], inf_energy, cost_config)
+        r["inference_energy_J"] = cc.inference_energy_J
+        r["total_energy_J"] = cc.total_energy_J
+        r["combined_cost"] = cc.combined_cost
+    print(
+        f"Run energy: {total_run_energy_J:.2f} J over {run_wall_s:.1f} s "
+        f"({frames_processed} frames)"
+    )
+
     if frames_processed == 0:
         raise RuntimeError(
             "No frames were evaluated. Check --scene_begin/--scene_end against "
@@ -846,6 +952,7 @@ def main(args):
     # ------------------------------------------------------------------
     # CSV output
     # ------------------------------------------------------------------
+    # Top-level results directory (summary.csv lives here and aggregates runs).
     csv_dir = args.csv_path if args.csv_path else logger_root
 
     # Infer split name from data path  (…/V2X-Sim-det/val  →  "val")
@@ -854,8 +961,23 @@ def main(args):
 
     sel_method_label = args.sel_method if args.selection else "all_agents"
 
-    # Per-frame cost CSV
-    frame_csv_path = os.path.join(csv_dir, "frame_costs.csv")
+    # ── Run identity: timestamp + descriptive run_id ────────────────────────
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    scenes_evaluated = sorted(scene_selected.keys())
+    scene_range = f"{args.scene_begin}-{args.scene_end}"
+    run_id = f"{timestamp}_{flag}_{sel_method_label}_{split_name}"
+    if args.selection and sel_method_label == "bandwidth":
+        run_id += f"_b{args.budget_mb}"
+    elif args.selection and sel_method_label in ("closest_k", "velocity", "heuristic"):
+        run_id += f"_K{args.K}"
+
+    # Per-run subdirectory: never clobbers previous runs' frame-level CSVs.
+    run_dir = os.path.join(csv_dir, "runs", run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    print_and_write_log(f"Run outputs -> {run_dir}")
+
+    # ── Per-frame cost CSV (one fresh file per run) ─────────────────────────
+    frame_csv_path = os.path.join(run_dir, "frame_costs.csv")
     if frame_cost_rows:
         frame_fieldnames = list(frame_cost_rows[0].keys())
         with open(frame_csv_path, "w", newline="") as f:
@@ -864,15 +986,17 @@ def main(args):
             writer.writerows(frame_cost_rows)
         print_and_write_log(f"Per-frame cost CSV saved to {frame_csv_path}")
 
-    # Per-scene CSV
-    scene_csv_path = os.path.join(csv_dir, "scene_stats.csv")
+    # ── Per-scene CSV (one fresh file per run) ──────────────────────────────
+    scene_csv_path = os.path.join(run_dir, "scene_stats.csv")
     scene_rows = []
-    for sid in sorted(scene_selected.keys()):
+    for sid in scenes_evaluated:
         sel_vals = scene_selected[sid]
         avail_vals = scene_available[sid]
         scene_rows.append({
+            "timestamp": timestamp,
             "scene_id": sid,
             "split": split_name,
+            "com": args.com,
             "sel_method": sel_method_label,
             "K": args.K,
             "budget_mb": args.budget_mb,
@@ -881,30 +1005,35 @@ def main(args):
             "avg_n_selected": sum(sel_vals) / max(1, len(sel_vals)),
         })
     if scene_rows:
-        write_header = not os.path.exists(scene_csv_path)
-        with open(scene_csv_path, "a", newline="") as f:
+        with open(scene_csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(scene_rows[0].keys()))
-            if write_header:
-                writer.writeheader()
+            writer.writeheader()
             writer.writerows(scene_rows)
-        print_and_write_log(f"Per-scene stats CSV saved/appended to {scene_csv_path}")
+        print_and_write_log(f"Per-scene stats CSV saved to {scene_csv_path}")
 
-    # Summary CSV (one row per run, appends for easy comparison across strategies)
+    # ── Summary CSV (top-level, appends one row per run for comparison) ─────
     summary_csv_path = os.path.join(csv_dir, "summary.csv")
     def _avg(key):
         return sum(r[key] for r in frame_cost_rows) / max(1, len(frame_cost_rows))
 
     all_n_selected = [r["n_selected"] for r in frame_cost_rows]
     summary_row = {
+        "timestamp": timestamp,
+        "run_id": run_id,
+        "com": args.com,
         "flag": flag,
         "split": split_name,
+        "selection": int(args.selection),
         "sel_method": sel_method_label,
+        "scene_range": scene_range,
+        "scenes_evaluated": ";".join(str(s) for s in scenes_evaluated),
         "K": args.K,
         "budget_mb": args.budget_mb,
         "link_rate_mbps": args.link_rate_mbps,
         "rsu": args.rsu,
         "total_scenes": len(scene_selected),
         "n_frames": frames_processed,
+        "run_wall_s": round(run_wall_s, 1),
         "mAP_05": mean_ap_local[-2],
         "mAP_07": mean_ap_local[-1],
         "avg_n_selected": sum(all_n_selected) / max(1, len(all_n_selected)),
@@ -916,6 +1045,7 @@ def main(args):
         "avg_precomp_energy_J": _avg("precomp_energy_J"),
         "avg_inference_energy_J": _avg("inference_energy_J"),
         "avg_total_energy_J": _avg("total_energy_J"),
+        "total_run_energy_J": round(total_run_energy_J, 3),
         "avg_combined_cost": _avg("combined_cost"),
     }
     write_header = not os.path.exists(summary_csv_path)
@@ -924,7 +1054,41 @@ def main(args):
         if write_header:
             writer.writeheader()
         writer.writerow(summary_row)
-    print_and_write_log(f"Summary CSV saved/appended to {summary_csv_path}")
+    print_and_write_log(f"Summary CSV appended to {summary_csv_path}")
+
+    # ── Auto-write inference norm for this model (identity runs only) ────────
+    # Any run with sel_method=identity is by definition the all-agents baseline
+    # for this model. Write its avg_inference_ms into inference_norms.json so
+    # all subsequent runs with the same model never need --max_inference_ms.
+    if sel_method_label == "identity":
+        _norms = _load_inference_norms()
+        _norms[norm_key] = {
+            "avg_inference_ms": summary_row["avg_inference_ms"],
+            "avg_inference_energy_J": summary_row["avg_inference_energy_J"],
+            "recorded_at": timestamp,
+            "run_id": run_id,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(inference_norms_path)), exist_ok=True)
+        with open(inference_norms_path, "w") as f:
+            json.dump(_norms, f, indent=2)
+        print_and_write_log(
+            f"Inference norm saved: {norm_key} → "
+            f"{summary_row['avg_inference_ms']:.1f} ms  ({inference_norms_path})"
+        )
+
+    # ── Run metadata JSON (full provenance for the thesis) ──────────────────
+    metadata = {
+        **summary_row,
+        "resume_checkpoint": args.resume,
+        "data_prep": args.data_prep,
+        "apply_late_fusion": args.apply_late_fusion,
+        "num_agent": args.num_agent,
+        "max_inference_ms": args.max_inference_ms,
+        "cost_norms_calibrated": cost_config.norms_calibrated,
+        "norm_key": norm_key,
+    }
+    with open(os.path.join(run_dir, "metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
 
     if need_log:
         saver.close()
@@ -952,7 +1116,7 @@ if __name__ == "__main__":
         help="The path to the state feature files for agent selection",
     )
     parser.add_argument("--nepoch", default=100, type=int, help="Number of epochs")
-    parser.add_argument("--nworker", default=1, type=int, help="Number of workers")
+    parser.add_argument("--nworker", default=4, type=int, help="Number of DataLoader workers")
     parser.add_argument("--lr", default=0.001, type=float, help="Initial learning rate")
     parser.add_argument("--log", action="store_true", help="Whether to log")
     parser.add_argument("--logpath", default="", help="The path to the output log file")

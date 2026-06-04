@@ -102,7 +102,7 @@ class StateIndex:
         self.prev_state: Dict[Tuple[int, int], AgentMeta] = {}
 
     @classmethod
-    def from_fs(cls, root: str) -> "StateIndex":
+    def from_fs(cls, root: str, scene_ids=None) -> "StateIndex":
         """
         Build a StateIndex from a folder tree:
 
@@ -115,6 +115,12 @@ class StateIndex:
               scene_001/
                 ...
 
+        Args:
+            root: path to the state-feature folder tree.
+            scene_ids: optional iterable of scene ids to load. When given, scenes
+                outside this set are skipped, which avoids reading tens of
+                thousands of JSON files for scenes that will never be evaluated.
+
         Returns:
             StateIndex with frame_index[(scene_id, frame_id)] -> List[AgentMeta]
         """
@@ -122,7 +128,9 @@ class StateIndex:
 
         frame_index: Dict[Tuple[int, int], List[AgentMeta]] = {}
 
-        print("Loading index...")
+        scene_filter = set(scene_ids) if scene_ids is not None else None
+        print("Loading index..." if scene_filter is None
+              else f"Loading index for scenes {sorted(scene_filter)}...")
 
         for scene_name in sorted(os.listdir(root)):
             if not scene_name.startswith("scene_"):
@@ -134,6 +142,9 @@ class StateIndex:
             try:
                 scene_id = int(scene_name.split("_")[1])
             except (IndexError, ValueError):
+                continue
+
+            if scene_filter is not None and scene_id not in scene_filter:
                 continue
 
             for frame_name in sorted(os.listdir(scene_dir)):
