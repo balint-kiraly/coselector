@@ -1,8 +1,27 @@
+# ── Fork-safety: cap OpenBLAS/OMP threads to 1 BEFORE numpy is imported ─────
+# numpy links against OpenBLAS (pthreads flavour, 32 threads by default).
+# fork() copies the parent's mutex state but NOT its threads, so any BLAS call
+# in a forked child (e.g. np.linalg.norm in compute_overlaps_gen_gt) tries to
+# synchronise with threads that don't exist → heap corruption → SIGSEGV.
+# Setting these env-vars to "1" prevents OpenBLAS from spinning up the pool.
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+# Also force matplotlib to a non-interactive backend so pyplot import does not
+# open a display connection (another source of fork-unsafe file descriptors).
+os.environ.setdefault("MPLBACKEND", "Agg")
+# ─────────────────────────────────────────────────────────────────────────────
+
 import argparse
+import faulthandler
+import fcntl
 import json
 import math
-import os
+import multiprocessing
+import sys
 import time
+import traceback
 
 import numpy as np
 
@@ -42,16 +61,24 @@ def _load_completed(save_path):
 
 
 def _mark_completed(save_path, agent_id, scene_id, completed):
-    """Add (agent_id, scene_id) to completed and persist atomically."""
-    key = f"agent_{agent_id}"
-    if key not in completed:
-        completed[key] = set()
-    completed[key].add(scene_id)
-
-    tmp = _completed_path(save_path) + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump({k: sorted(v) for k, v in completed.items()}, f, indent=2)
-    os.replace(tmp, _completed_path(save_path))
+    """Add (agent_id, scene_id) to completed and persist atomically.
+    Uses a lock file so parallel workers don't overwrite each other's updates.
+    """
+    lock_path = _completed_path(save_path) + ".lock"
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Re-read under lock so we don't lose another worker's concurrent write
+        fresh = _load_completed(save_path)
+        key = f"agent_{agent_id}"
+        if key not in fresh:
+            fresh[key] = set()
+        fresh[key].add(scene_id)
+        tmp = _completed_path(save_path) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({k: sorted(v) for k, v in fresh.items()}, f, indent=2)
+        os.replace(tmp, _completed_path(save_path))
+        # Propagate to caller's in-memory dict too
+        completed.update({k: set(v) for k, v in fresh.items()})
 
 
 def check_folder(folder_name):
@@ -60,11 +87,17 @@ def check_folder(folder_name):
 
 
 # ---------------------- Extract the scenes, and then pre-process them into BEV maps ----------------------
-def create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args_savepath, only_split=None, completed=None):
+def create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args_savepath, only_split=None, completed=None, scene_offset=0):
     """
     Args:
-        completed: mutable dict returned by _load_completed().  Pass None to
-                   disable skip-on-rerun (useful for forced reruns).
+        completed:     mutable dict returned by _load_completed().  Pass None to
+                       disable skip-on-rerun (useful for forced reruns).
+        scene_offset:  value that was subtracted from coperception_dataset.scene
+                       when subsetting the list in __main__ (= the global
+                       scene_begin passed at startup).  Used to convert an
+                       absolute scene_idx back to a list position:
+                           coperception_dataset.scene[scene_idx - scene_offset]
+                       Defaults to 0 (no subsetting, full dataset loaded).
     """
     channel = "LIDAR_TOP_id_" + str(current_agent)
     total_sample = 0
@@ -75,7 +108,7 @@ def create_data(coperception_dataset, current_agent, scene_begin, scene_end, sce
     )
 
     for scene_idx in res_scenes[scene_begin:scene_end]:
-        curr_scene = coperception_dataset.scene[scene_idx]
+        curr_scene = coperception_dataset.scene[scene_idx - scene_offset]
         split = None
 
         for s in ['train', 'val', 'test']:
@@ -129,7 +162,7 @@ def create_data(coperception_dataset, current_agent, scene_begin, scene_end, sce
                 )
                 save_file_name = os.path.join(save_directory, "0.npy")
                 np.save(save_file_name, 0)
-                print("  >> Finish sample: {}".format(num_sample))
+                print("  >> [agent {}] Finish sample: {}".format(current_agent, num_sample))
 
         # -------------------------------------------------------------------------------------------------
         # ------------------------ We only calculate non-empty channels -----------------------------------
@@ -313,8 +346,8 @@ def create_data(coperception_dataset, current_agent, scene_begin, scene_end, sce
                     np.save(save_file_name, arr=sparse_bev_data)
                     total_sample += 1
                     print(
-                        "  >> Finish sample: {}, sequence {} takes {} s".format(
-                            save_seq_cnt, seq_idx, time.time() - t
+                        "  >> [agent {}] Finish sample: {}, sequence {} takes {} s".format(
+                            current_agent, save_seq_cnt, seq_idx, time.time() - t
                         )
                     )
 
@@ -423,8 +456,18 @@ def convert_to_dense_bev(seq_data_dict, config):
 
     visibility_maps = []
 
+    # Shape of each visibility map element: (map_dims[0], map_dims[1], map_dims[2])
+    _vis_shape = [config.map_dims[0], config.map_dims[1], config.map_dims[2]]
+
     if config.is_cross_road:
-        visibility_maps.append(np.zeros([256, 256, 13]))
+        visibility_maps.append(np.zeros(_vis_shape))
+    elif not config.use_vis:
+        # use_vis=False (default): visibility maps are never loaded during eval.
+        # Skip the C extension call entirely — it segfaults on certain scenes
+        # when point clouds fall outside grid extents (out-of-bounds array access
+        # in mapping.cpython-37m-x86_64-linux-gnu.so / compute_logodds_dp).
+        for idx in range(origins.shape[0]):
+            visibility_maps.append(np.zeros(_vis_shape))
     else:
         extents = config.area_extents
         for idx in range(origins.shape[0]):
@@ -448,7 +491,7 @@ def convert_to_dense_bev(seq_data_dict, config):
                     range(pts.shape[0]),
                     min(config.voxel_size),
                 )
-            )  # , lo_occupied, lo_free
+            )
 
     # Compile the batch of voxels, so that they can be fed into the network.
     # Note that, the padded_voxel_points in this script will only be used for sanity check.
@@ -517,7 +560,7 @@ def convert_to_dense_bev(seq_data_dict, config):
     )
 
     if label is None:
-        print("label is none")
+        print("label is none (agent {})".format(data_dict.get("target_agent_id", "?")))
         return None
 
     else:
@@ -643,6 +686,105 @@ def convert_to_sparse_bev(config, dense_bev_data, use_motion_state=False):
     return save_data_dict
 
 
+# Module-level worker so multiprocessing fork can resolve it by name.
+# Inherits coperception_dataset from the parent process via CoW fork.
+def _agent_worker(args):
+    # Enable faulthandler so C-level crashes (SIGSEGV etc.) print a Python
+    # stack trace to stderr instead of dying silently.
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+
+    # Second line of defence: even if OpenBLAS was initialised with >1 thread
+    # in the parent before the fork, threadpoolctl can lower the limit at
+    # runtime before any BLAS call is made in this child process.
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(1)
+    except ImportError:
+        pass  # threadpoolctl optional; env-vars above are the primary guard
+
+    agent, scene_idx, scene_splits, save_path, only_split, scene_offset = args
+    try:
+        create_data(
+            coperception_dataset, agent,
+            scene_idx, scene_idx + 1,
+            scene_splits, save_path,
+            only_split=only_split,
+            completed=_load_completed(save_path),
+            scene_offset=scene_offset,
+        )
+    except Exception:
+        # Print the full traceback with worker context before letting pool.map
+        # re-raise, so it isn't silently swallowed on certain pool backends.
+        print(
+            f"\n[worker pid={os.getpid()} agent={agent} scene={scene_idx}] "
+            f"EXCEPTION:\n{traceback.format_exc()}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
+
+
+def _run_agents_with_retry(worker_args_list, max_retries, scene_idx):
+    """Launch one worker Process per agent in parallel and restart crashed workers.
+
+    A SIGSEGV (or any non-zero exit) is treated as a transient failure:
+    the worker is relaunched up to ``max_retries`` additional times.
+    Workers that exit cleanly (exit code 0) are never retried.
+
+    Args:
+        worker_args_list: list of arg-tuples, one per agent.
+        max_retries:      maximum number of *extra* attempts after the first.
+                          total attempts per agent = max_retries + 1.
+        scene_idx:        scene number, used only for log messages.
+    """
+    ctx = multiprocessing.get_context("fork")
+    # pending: list of (args_tuple, attempt_number_starting_at_1)
+    pending = [(wargs, 1) for wargs in worker_args_list]
+
+    while pending:
+        # Launch all pending agents in parallel
+        running = []
+        for wargs, attempt in pending:
+            p = ctx.Process(target=_agent_worker, args=(wargs,))
+            p.start()
+            running.append((p, wargs, attempt))
+            print(
+                f"  [scene {scene_idx} agent {wargs[0]}] started "
+                f"(attempt {attempt}/{max_retries + 1}, pid={p.pid})",
+                flush=True,
+            )
+
+        # Wait for every process; collect failures for retry
+        pending = []
+        for p, wargs, attempt in running:
+            p.join()
+            agent = wargs[0]
+            if p.exitcode == 0:
+                print(
+                    f"  [scene {scene_idx} agent {agent}] finished OK.",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  [scene {scene_idx} agent {agent}] exited with code "
+                    f"{p.exitcode} on attempt {attempt}/{max_retries + 1}.",
+                    file=sys.stderr, flush=True,
+                )
+                if attempt <= max_retries:
+                    print(
+                        f"  [scene {scene_idx} agent {agent}] restarting "
+                        f"(attempt {attempt + 1}/{max_retries + 1}) ...",
+                        flush=True,
+                    )
+                    pending.append((wargs, attempt + 1))
+                else:
+                    print(
+                        f"  [scene {scene_idx} agent {agent}] failed after "
+                        f"{max_retries + 1} attempts — skipping.",
+                        file=sys.stderr, flush=True,
+                    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -676,6 +818,17 @@ if __name__ == "__main__":
         help="If set, only process scenes belonging to this split (train/val/test). "
              "Scenes from other splits in the scene_begin..scene_end range are skipped.",
     )
+    parser.add_argument(
+        "--no_parallel", action="store_true",
+        help="Disable multiprocessing: process every (scene, agent) pair sequentially "
+             "in the main process. Exceptions and tracebacks are always visible. "
+             "Use this to diagnose crashes that are silent under the parallel pool.",
+    )
+    parser.add_argument(
+        "--max_retries", type=int, default=2,
+        help="Maximum number of extra attempts for a worker that crashes (non-zero "
+             "exit code). Total attempts per agent = max_retries + 1. Default: 2.",
+    )
     args = parser.parse_args()
 
     dataset_version = args.dataset_version
@@ -686,8 +839,23 @@ if __name__ == "__main__":
         scene_begin = 0
         scene_end = 1
 
+    # Assign to module global so forked workers can access it without pickling
+    global coperception_dataset
     coperception_dataset = CoPerceptionDataset(version=dataset_version, dataroot=args.root, verbose=True)
-    print("Total number of scenes:", len(coperception_dataset.scene))
+    total_scenes = len(coperception_dataset.scene)
+    print("Total number of scenes:", total_scenes)
+
+    # ── Dataset subsetting (mirrors test_codet_selector Speedup 2) ───────────
+    # Trim the scene list to only the requested range BEFORE forking workers.
+    # Forked processes inherit the smaller list via CoW, so they never hold
+    # references to out-of-range scene objects in memory.
+    # create_data receives scene_offset=scene_begin so it can convert absolute
+    # scene indices back to list positions after the trim.
+    coperception_dataset.scene = coperception_dataset.scene[scene_begin:scene_end]
+    print(
+        f"Scene subset: keeping scenes {scene_begin}–{scene_end - 1} "
+        f"({len(coperception_dataset.scene)}/{total_scenes})"
+    )
 
 
     scene_files_loc = './configs/scene_split'
@@ -705,5 +873,52 @@ if __name__ == "__main__":
         total_done = sum(len(v) for v in completed.values())
         print(f"Resuming: {total_done} (agent, scene) pairs already completed — will skip.")
 
-    for current_agent in range(args.from_agent, args.to_agent):
-        create_data(coperception_dataset, current_agent, scene_begin, scene_end, scene_splits, args.save_path, only_split=args.only_split, completed=completed)
+    # ── Scene-first loop with parallel agents ────────────────────────────────
+    # Outer loop: scenes — so each scene is fully finished before moving on.
+    # Inner pool: one worker per agent, all running in parallel for that scene.
+    # Workers inherit the dataset via fork (Linux CoW — no serialisation cost).
+
+    for scene_idx in range(scene_begin, scene_end):
+        # Determine split and apply only_split filter
+        split = None
+        for s in ['train', 'val', 'test']:
+            if scene_idx in scene_splits[s]:
+                split = s
+                break
+        if split is None:
+            print(f"Scene {scene_idx}: not found in any split, skipping.")
+            continue
+        if args.only_split and split != args.only_split:
+            continue
+
+        # Which agents still need processing?
+        agents_todo = [
+            a for a in range(args.from_agent, args.to_agent)
+            if scene_idx not in completed.get(f"agent_{a}", set())
+        ]
+        if not agents_todo:
+            print(f"Scene {scene_idx} ({split}): all agents done — skipping.")
+            continue
+
+        print(f"\n=== Scene {scene_idx} ({split}) — agents {agents_todo} ===")
+
+        # Pack args so pool.map receives a plain tuple (avoids closure capture issues).
+        # scene_begin is passed as scene_offset so workers can index into the
+        # trimmed coperception_dataset.scene list using absolute scene numbers.
+        worker_args = [
+            (agent, scene_idx, scene_splits, args.save_path, args.only_split, scene_begin)
+            for agent in agents_todo
+        ]
+
+        if args.no_parallel:
+            # Sequential mode: run every agent in the main process.
+            # All Python exceptions surface with a full traceback.
+            # C-level crashes also print a stack trace because faulthandler
+            # is enabled inside _agent_worker.
+            for wargs in worker_args:
+                _agent_worker(wargs)
+        else:
+            _run_agents_with_retry(worker_args, args.max_retries, scene_idx)
+
+        # Sync in-memory completed dict after all agents finish
+        completed = _load_completed(args.save_path)

@@ -53,7 +53,7 @@ train_patience := 7
 # Idempotent: completed scenes are tracked in bev_completed.json /
 # state_completed.json and skipped on reruns.
 create_data:
-	python preprocess/bev_precompute.py \
+	CUDA_VISIBLE_DEVICES="" python -u preprocess/bev_precompute.py \
 		--root $(original_data_path) \
 		--scene_begin $(scene_begin) \
 		--scene_end $(scene_end) \
@@ -63,7 +63,7 @@ create_data:
 		--dataset_version $(dataset_version) \
 		$(if $(only_split),--only_split $(only_split),)
 
-	python -m preprocess.state_precompute \
+	CUDA_VISIBLE_DEVICES="" python -u -m preprocess.state_precompute \
 		--root $(original_data_path) \
 		--scene_begin $(scene_begin) \
 		--scene_end $(scene_end) \
