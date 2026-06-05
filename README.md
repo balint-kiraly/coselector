@@ -159,20 +159,23 @@ Each run writes to a timestamped subdirectory under `results/`:
 
 ```
 results/lowerbound_eval/with_rsu/
-  summary.csv                 ← one row per run (mAP, avg cost, avg agents, …)
-  runs/{timestamp}_{method}/
-    frame_costs.csv           ← per-frame: bandwidth_MB, latency_ms, energy_J, cost
-    scene_stats.csv           ← per-scene averages
-    metadata.json             ← full provenance (checkpoint, args, norms, …)
+  summary.csv                   ← one row per run, append mode across all runs
+  runs/{timestamp}_{flag}_{method}[_K3|_b1.5]/
+    frame_costs.csv             ← per-frame: bandwidth_MB, latency_ms, energy_J, cost
+    scene_stats.csv             ← per-scene averages
+    summary.json                ← self-contained copy of this run's summary row
+    metadata.json               ← full provenance (checkpoint, args, norms, …)
 ```
 
-`summary.csv` is append-only — all runs accumulate in one file for easy comparison.
+`summary.csv` is append-only — all runs accumulate in one file for easy comparison.  
+Each run also gets its own `summary.json` inside its directory for standalone access.
 
 Key columns in `summary.csv`:
 
 | Column | Description |
 |---|---|
 | `mAP_05` / `mAP_07` | Detection mAP at IoU 0.5 / 0.7 |
+| `recall_05` / `recall_07` | Max recall on P-R curve at IoU 0.5 / 0.7 |
 | `avg_n_selected` | Mean vehicles selected per frame |
 | `avg_bandwidth_MB` | Mean LiDAR upload per frame |
 | `avg_latency_total_ms` | Mean end-to-end latency |

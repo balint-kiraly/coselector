@@ -54,7 +54,8 @@ NuScenes format   ──bev_precompute──▶  V2X-Sim-det/{train,val,test}/ag
                     │       ↓                                             │
                     │  CSV logging: frame_costs.csv                      │
                     │               scene_stats.csv                      │
-                    │               summary.csv                          │
+                    │               summary.csv  (appended, global)      │
+                    │               summary.json (per-run copy)          │
                     │               metadata.json                        │
                     └─────────────────────────────────────────────────────┘
 ```
@@ -109,7 +110,7 @@ of the original evaluation loop — the original loop structure and mAP computat
 | `_timed_forward()` with `cuda.synchronize()` | GPU-accurate inference timing |
 | Run-level `codecarbon` energy tracker | One tracker for the whole run; per-frame energy distributed proportionally to inference time |
 | Inference norm auto-save | Identity runs write `measurements/inference_norms.json` for reuse in subsequent runs |
-| Structured CSV/JSON output | `frame_costs.csv`, `scene_stats.csv`, `summary.csv`, `metadata.json` per run |
+| Structured CSV/JSON output | `frame_costs.csv`, `scene_stats.csv`, `summary.csv` (global append), `summary.json` (per-run), `metadata.json` per run |
 
 ---
 
@@ -318,7 +319,7 @@ Key additions over the original:
 | Run-level energy tracker | Single `codecarbon.EmissionsTracker` for the whole run; per-frame energy distributed proportionally to inference time (avoids 3 s/frame blocking stop) |
 | `_timed_forward()` | GPU-synchronized inference timing via `torch.cuda.synchronize()` |
 | Inference norm auto-save | Identity runs write `measurements/inference_norms.json` for reuse |
-| CSV outputs | `frame_costs.csv`, `scene_stats.csv`, `summary.csv`, `metadata.json` per run |
+| CSV/JSON outputs | `frame_costs.csv`, `scene_stats.csv` per run; `summary.json` per-run copy; `summary.csv` global append (includes `mAP_05`, `mAP_07`, `recall_05`, `recall_07`); `metadata.json` provenance |
 
 **RSU-centric evaluation mode** (`--rsu 1 --selection`):
 - The RSU GT (`gt_max_iou` from agent 0) is saved before agent filtering.
@@ -373,11 +374,12 @@ After all frames:
 results/
   lowerbound_eval/with_rsu/
     log_test.txt
-    summary.csv              ← one row per run; append mode across runs
+    summary.csv              ← one row per run; append mode across all runs
     runs/
-      {timestamp}_{flag}_{method}_{split}/
+      {timestamp}_{flag}_{method}[_K3|_b1.5]/
         frame_costs.csv      ← per-frame bandwidth, latency, energy, combined_cost
         scene_stats.csv      ← per-scene averages
+        summary.json         ← self-contained copy of this run's summary row
         metadata.json        ← full provenance (checkpoint, args, norm key, …)
 ```
 

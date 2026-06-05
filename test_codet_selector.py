@@ -337,6 +337,10 @@ def main(args):
     det_results_local = [[] for i in agent_idx_range]
     annotations_local = [[] for i in agent_idx_range]
 
+    # per-scene detection accumulation (for per-scene AP/recall in scene_stats.csv)
+    scene_det_results: dict = {}   # scene_id -> list
+    scene_annotations: dict = {}   # scene_id -> list
+
     tracking_file = [set()] * num_agent
 
     sel_model = None
@@ -480,6 +484,12 @@ def main(args):
                 for i in selected_state_indices
                 if metas[i].agent_id in agent_id_to_idx
             ]
+            # Record the actual agent IDs (not internal indices) for the frame log
+            selected_agent_ids_str = ",".join(
+                str(metas[i].agent_id)
+                for i in selected_state_indices
+                if metas[i].agent_id in agent_id_to_idx
+            )
             if not selected_indices:
                 # No agents selected (e.g. bandwidth budget too tight for even one agent).
                 # Record a zero-cost frame — no bandwidth spent, no inference, no detections.
@@ -493,6 +503,7 @@ def main(args):
                     "flag": flag,
                     "sel_method": args.sel_method if args.selection else "all_agents",
                     "n_available": n_available, "n_selected": 0,
+                    "selected_agent_ids": "",
                     "bandwidth_MB": 0.0, "upload_ms": 0.0, "precomp_ms": 0.0,
                     "inference_ms": 0.0, "latency_total_ms": 0.0,
                     "precomp_energy_J": 0.0, "inference_energy_J": 0.0,
@@ -679,6 +690,11 @@ def main(args):
         # tracker total). Use 0 here — combined_cost depends on energy only when
         # alpha_energy > 0, and the post-loop pass recomputes it then.
         comm_cost = compute_cost(n_for_cost, inference_time_ms, 0.0, cost_config)
+        if args.selection:
+            _frame_agent_ids = selected_agent_ids_str
+        else:
+            # All-agents baseline: record all agents in the current idx range
+            _frame_agent_ids = ",".join(str(a) for a in agent_idx_range)
         frame_cost_rows.append({
             "scene_id": scene_id,
             "frame_id": frame_id,
@@ -686,6 +702,7 @@ def main(args):
             "sel_method": args.sel_method if args.selection else "all_agents",
             "n_available": n_available,
             "n_selected": n_for_cost,
+            "selected_agent_ids": _frame_agent_ids,
             "bandwidth_MB": comm_cost.bandwidth_MB,
             "upload_ms": comm_cost.upload_ms,
             "precomp_ms": comm_cost.precomp_ms,
@@ -752,6 +769,12 @@ def main(args):
             }
             det_results_local[k], annotations_local[k] = cal_local_mAP(
                 config, temp, det_results_local[k], annotations_local[k]
+            )
+            # also accumulate per-scene for scene-level AP/recall
+            _sd = scene_det_results.setdefault(scene_id, [])
+            _sa = scene_annotations.setdefault(scene_id, [])
+            scene_det_results[scene_id], scene_annotations[scene_id] = cal_local_mAP(
+                config, temp, _sd, _sa
             )
 
             filename = str(filename0[0][0])
@@ -910,7 +933,7 @@ def main(args):
         det_results_all_local += det_results_local[k]
         annotations_all_local += annotations_local[k]
 
-    mean_ap_local_average, _ = eval_map(
+    mean_ap_local_average, _eval_res_05 = eval_map(
         det_results_all_local,
         annotations_all_local,
         scale_ranges=None,
@@ -920,7 +943,7 @@ def main(args):
     )
     mean_ap_local.append(mean_ap_local_average)
 
-    mean_ap_local_average, _ = eval_map(
+    mean_ap_local_average, _eval_res_07 = eval_map(
         det_results_all_local,
         annotations_all_local,
         scale_ranges=None,
@@ -929,6 +952,18 @@ def main(args):
         logger=None,
     )
     mean_ap_local.append(mean_ap_local_average)
+
+    # Extract max recall achieved (last point on P-R curve) for each threshold.
+    # eval_results[0] is the single vehicle class; recall is a 1-D array.
+    def _max_recall(eval_res):
+        try:
+            r = eval_res[0]["recall"]
+            return float(r[-1]) if len(r) > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    recall_05 = _max_recall(_eval_res_05)
+    recall_07 = _max_recall(_eval_res_07)
 
     print_and_write_log(
         "Quantitative evaluation results of model from {}, at epoch {}".format(
@@ -965,7 +1000,7 @@ def main(args):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     scenes_evaluated = sorted(scene_selected.keys())
     scene_range = f"{args.scene_begin}-{args.scene_end}"
-    run_id = f"{timestamp}_{flag}_{sel_method_label}_{split_name}"
+    run_id = f"{timestamp}_{flag}_{sel_method_label}"
     if args.selection and sel_method_label == "bandwidth":
         run_id += f"_b{args.budget_mb}"
     elif args.selection and sel_method_label in ("closest_k", "velocity", "heuristic"):
@@ -988,10 +1023,31 @@ def main(args):
 
     # ── Per-scene CSV (one fresh file per run) ──────────────────────────────
     scene_csv_path = os.path.join(run_dir, "scene_stats.csv")
+
+    def _scene_ap_recall(scene_id):
+        """Compute mAP@0.5, mAP@0.7, recall@0.5, recall@0.7 for one scene."""
+        dets = scene_det_results.get(scene_id, [])
+        anns = scene_annotations.get(scene_id, [])
+        if not dets or not anns:
+            return 0.0, 0.0, 0.0, 0.0
+        try:
+            ap05, er05 = eval_map(dets, anns, scale_ranges=None, iou_thr=0.5, dataset=None, logger=None)
+            ap07, er07 = eval_map(dets, anns, scale_ranges=None, iou_thr=0.7, dataset=None, logger=None)
+            def _last_recall(er):
+                try:
+                    r = er[0]["recall"]
+                    return float(r[-1]) if len(r) > 0 else 0.0
+                except Exception:
+                    return 0.0
+            return float(ap05), float(ap07), _last_recall(er05), _last_recall(er07)
+        except Exception:
+            return 0.0, 0.0, 0.0, 0.0
+
     scene_rows = []
     for sid in scenes_evaluated:
         sel_vals = scene_selected[sid]
         avail_vals = scene_available[sid]
+        s_ap05, s_ap07, s_rec05, s_rec07 = _scene_ap_recall(sid)
         scene_rows.append({
             "timestamp": timestamp,
             "scene_id": sid,
@@ -1003,6 +1059,10 @@ def main(args):
             "n_frames": len(sel_vals),
             "avg_n_available": sum(avail_vals) / max(1, len(avail_vals)),
             "avg_n_selected": sum(sel_vals) / max(1, len(sel_vals)),
+            "mAP_05": s_ap05,
+            "mAP_07": s_ap07,
+            "recall_05": s_rec05,
+            "recall_07": s_rec07,
         })
     if scene_rows:
         with open(scene_csv_path, "w", newline="") as f:
@@ -1036,6 +1096,8 @@ def main(args):
         "run_wall_s": round(run_wall_s, 1),
         "mAP_05": mean_ap_local[-2],
         "mAP_07": mean_ap_local[-1],
+        "recall_05": recall_05,
+        "recall_07": recall_07,
         "avg_n_selected": sum(all_n_selected) / max(1, len(all_n_selected)),
         "avg_bandwidth_MB": _avg("bandwidth_MB"),
         "avg_upload_ms": _avg("upload_ms"),
@@ -1055,6 +1117,12 @@ def main(args):
             writer.writeheader()
         writer.writerow(summary_row)
     print_and_write_log(f"Summary CSV appended to {summary_csv_path}")
+
+    # ── Per-run summary JSON (self-contained, lives in run_dir) ─────────────
+    run_summary_path = os.path.join(run_dir, "summary.json")
+    with open(run_summary_path, "w") as f:
+        json.dump(summary_row, f, indent=2)
+    print_and_write_log(f"Per-run summary saved to {run_summary_path}")
 
     # ── Auto-write inference norm for this model (identity runs only) ────────
     # Any run with sel_method=identity is by definition the all-agents baseline
