@@ -462,11 +462,17 @@ def main(args):
 
             # ------------------ Agent Selection Model ------------------
             if args.selection and args.sel_method == "ml_model" and cnt == 0:
-                sel_model = AgentSelectorMLP(input_dim=state_feats.shape[1])
+                # The ML selector always takes 12 engineered features
+                # (build_selector_features), not the raw 14-field state tensor.
+                sel_model = AgentSelectorMLP(input_dim=12)
                 sel_model = sel_model.to(device)
-                #sel_model = nn.DataParallel(sel_model)
                 assert args.sel_model_path is not None, "Path to trained agent selection model is not provided"
-                sel_model.load_state_dict(torch.load(args.sel_model_path))
+                ckpt_data = torch.load(args.sel_model_path, map_location=device)
+                # Support both plain state_dict and full training checkpoint
+                if "model" in ckpt_data:
+                    sel_model.load_state_dict(ckpt_data["model"])
+                else:
+                    sel_model.load_state_dict(ckpt_data)
                 sel_model.eval()
                 print(f"Loaded agent selection model from {args.sel_model_path}")
 

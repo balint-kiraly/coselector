@@ -1,424 +1,843 @@
+"""
+REINFORCE training for the learned agent selector.
+
+Usage example:
+    python -m selection.train_selector \
+        --ckpt /path/to/det.pth \
+        --data_det /mnt/.../V2X-Sim-det/train \
+        --data_state /mnt/.../V2X-Sim-States \
+        --save_dir /tmp/selector_run \
+        --train_scene_begin 0 --train_scene_end 100 \
+        --val_scene_begin 0 --val_scene_end 100 \
+        --rl_epochs 20 --curriculum_epochs 3 \
+        --lambda_cost 0.4 --lr 1e-3
+"""
+
 import argparse
-import json
+import csv
 import os
-from datetime import datetime
-from typing import List
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import sys
+import time
 
 import torch
-from torch import optim, nn
-from torch.utils.data import DataLoader
+import torch.nn as nn
+from torch import optim
+from torch.distributions import Bernoulli
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from coperception import Config, ConfigGlobal
+from coperception.configs import Config, ConfigGlobal
+from coperception.datasets import V2XSimDet
 from coperception.models.det import FaFNet
-from coperception.models.det.base import DetModelBase
-from coperception.utils.CoDetModule import FaFModule
-from coperception.utils.loss import SoftmaxFocalClassificationLoss, WeightedSmoothL1LocalizationLoss
+from coperception.utils.CoDetModule import FaFModule, cal_local_mAP
+from coperception.utils.loss import (
+    SoftmaxFocalClassificationLoss,
+    WeightedSmoothL1LocalizationLoss,
+)
+from coperception.utils.mean_ap import eval_map
+
 from data_utils.build_state_features import build_state_features
 from data_utils.state_index import StateIndex
 from selection.bev_builder import assemble_detection_inputs
 from selection.models import AgentSelectorMLP
 
-from coperception.datasets import V2XSimDet
 
+# ── Constants ──────────────────────────────────────────────────────────────────
+FEATURE_DIM = 12
+AGENT_START = 1
+AGENT_END = 6          # exclusive; vehicles 1-5
+AGENT_IDX_RANGE = range(AGENT_START, AGENT_END)
+N_MAX = len(AGENT_IDX_RANGE)   # 5
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="REINFORCE selector training")
 
     # data
-    p.add_argument("--data_det", type=str, required=True,
-                   help="Path to precomputed detection data.")
-    p.add_argument("--data_state", type=str, required=True,
-                   help="Path to state index files.")
+    p.add_argument("--ckpt", required=True, help="Frozen detection model checkpoint.")
+    p.add_argument("--data_det", required=True,
+                   help="Path to precomputed BEV data (train split directory).")
+    p.add_argument("--data_state", required=True,
+                   help="Path to state-feature JSON tree.")
+    p.add_argument("--save_dir", required=True,
+                   help="Directory for checkpoints and metrics CSV.")
 
-    p.add_argument("--scene_start", type=int, default=0)
-    p.add_argument("--scene_end", type=int, default=100)
-    p.add_argument("--agent_start", type=int, default=1)
-    p.add_argument("--agent_end", type=int, default=6)
+    # scene ranges
+    p.add_argument("--train_scene_begin", type=int, default=0)
+    p.add_argument("--train_scene_end", type=int, default=100)
+    p.add_argument("--val_scene_begin", type=int, default=0)
+    p.add_argument("--val_scene_end", type=int, default=100)
 
-    # model
-    p.add_argument("--ckpt", type=str, required=True,
-                   help="Detection model checkpoint to load.")
+    # training hypers
+    p.add_argument("--rl_epochs", type=int, default=20)
+    p.add_argument("--curriculum_epochs", type=int, default=3,
+                   help="Epochs with lambda_cost=0 to bootstrap detection quality.")
+    p.add_argument("--lambda_cost", type=float, default=0.4,
+                   help="Cost penalty weight (activated after curriculum).")
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--frames_per_epoch", type=int, default=0,
+                   help="Subsample training frames per epoch (0 = use all).")
     p.add_argument("--num_workers", type=int, default=1)
 
-    # RL selector
-    p.add_argument("--selector_hidden_dim", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--lambda_cost", type=float, default=1000,
-                   help="Bandwidth penalty weight.")
-    p.add_argument("--reward_baseline_momentum", type=float, default=0.9)
+    # validation
+    p.add_argument("--val_every", type=int, default=3,
+                   help="Validate every N epochs.")
+    p.add_argument("--data_val", type=str, default="",
+                   help="Val BEV data directory. Defaults to <data_det>/../val.")
+    p.add_argument("--sel_threshold", type=float, default=0.5,
+                   help="Greedy selection threshold used during validation.")
 
-    p.add_argument("--save_path", type=str, required=True,)
-    p.add_argument("--logs", type=str, default="/mnt/10TB/balintkiraly/results",
-                   help="Directory to save plots and frame-level selections.")
+    # logging
+    p.add_argument("--tensorboard", action="store_true",
+                   help="Log scalars to TensorBoard in save_dir.")
 
     return p.parse_args()
 
-def build_model_from_config(config, num_agent) -> DetModelBase:
-    return FaFNet(
-        config, kd_flag=False, num_agent=num_agent
-    )
 
+# ── Detector utilities ──────────────────────────────────────────────────────────
 
-def main():
-    args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    ckpt_name = os.path.splitext(os.path.basename(args.ckpt))[0]
-    exp_name = (
-        f"selector_{ckpt_name}_sc{args.scene_start}-{args.scene_end}"
-        f"_ag{args.agent_start}-{args.agent_end}_ep{args.epochs}_{timestamp}"
-    )
-    os.makedirs(args.logs, exist_ok=True)
-    log_dir = os.path.join(args.logs, exp_name)
-    os.makedirs(log_dir, exist_ok=True)
-    print(f"Logging to {log_dir}")
-
-    # not include RSU
-    args.agent_start = max(args.agent_start, 1)
-    num_agent = args.agent_end - args.agent_start + 1
-
-    # ------------------------------------------------------------------
-    # Build detection dataset + dataloader (train split)
-    # ------------------------------------------------------------------
-    print("Loading detection dataset...")
-    config = Config("train", binary=True, only_det=True)
-    config_global = ConfigGlobal("train", binary=True, only_det=True)
-    config.flag = "upperbound"
-    agent_idx_range = range(args.agent_start, args.agent_end)
-
-    train_dataset = V2XSimDet(
-        dataset_roots=[os.path.join(args.data_det, f"agent{i}") for i in agent_idx_range],
-        config=config,
-        config_global=config_global,
-        split="val",
-        val=True,
-        bound="upperbound",
-        kd_flag=False,
-        rsu=False,
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=1,
-        shuffle=True, # can be set to True later
-        num_workers=args.num_workers
-    )
-    print(f"Train dataset size: {len(train_dataset)} samples.")
-
-    # ------------------------------------------------------------------
-    # Build detection model (frozen)
-    # ------------------------------------------------------------------
-    print("Building detection model...")
-    det_model = build_model_from_config(config, num_agent)
-    det_model = nn.DataParallel(det_model)
-    det_model.to(device)
-    det_model.eval()
-    for p in det_model.parameters():
+def _build_fafmodule(config, ckpt_path: str, device: torch.device) -> FaFModule:
+    """Load the frozen FaFNet detector. Always uses num_agent=1 (fused BEV mode)."""
+    model = FaFNet(config, kd_flag=False, num_agent=1)
+    model = nn.DataParallel(model)
+    model.to(device)
+    model.eval()
+    for p in model.parameters():
         p.requires_grad = False
-    optimizer = optim.Adam(det_model.parameters(), lr=0.001)
+
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
     criterion = {
         "cls": SoftmaxFocalClassificationLoss(),
         "loc": WeightedSmoothL1LocalizationLoss(),
     }
+    fafmodule = FaFModule(model, model, config, optimizer, criterion, kd_flag=0)
 
-    fafmodule = FaFModule(det_model, det_model, config, optimizer, criterion, 0)
+    ckpt = torch.load(ckpt_path, map_location=device)
+    fafmodule.model.load_state_dict(ckpt["model_state_dict"])
+    fafmodule.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    fafmodule.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    print(f"Loaded frozen detector from {ckpt_path} (epoch {ckpt['epoch']})")
+    return fafmodule
 
-    checkpoint = torch.load(
-        args.ckpt, map_location=device
+
+def _agent_id_to_dataset_idx() -> dict:
+    return {aid: idx for idx, aid in enumerate(AGENT_IDX_RANGE)}
+
+
+def _ref_table_to_trans(trans_matrices_list) -> torch.Tensor:
+    """Extract the (N, 4, 4) transform table from a DataLoader batch item."""
+    ref = torch.as_tensor(trans_matrices_list[0], dtype=torch.float32)
+    # Shape: (1, N, 4, 4) or (N, 4, 4)
+    while ref.dim() > 3:
+        ref = ref.squeeze(0)
+    return ref  # (N, 4, 4)
+
+
+def _run_detector(fafmodule, config, selected_dataset_indices,
+                  pvp_list, pvp_teacher_list, label_list, reg_target_list,
+                  reg_loss_mask_list, anchors_list, vis_maps_list,
+                  target_agent_id_list, num_agent_list,
+                  trans_table: torch.Tensor, device: torch.device):
+    """Fuse selected BEVs and run the frozen detector. Returns det_loss scalar."""
+    def _sel(lst, indices):
+        return [lst[i] for i in indices]
+
+    data = assemble_detection_inputs(
+        config,
+        _sel(pvp_list, selected_dataset_indices),
+        _sel(pvp_teacher_list, selected_dataset_indices),
+        _sel(label_list, selected_dataset_indices),
+        _sel(reg_target_list, selected_dataset_indices),
+        _sel(reg_loss_mask_list, selected_dataset_indices),
+        _sel(anchors_list, selected_dataset_indices),
+        _sel(vis_maps_list, selected_dataset_indices),
+        _sel(target_agent_id_list, selected_dataset_indices),
+        _sel(num_agent_list, selected_dataset_indices),
+        [trans_table[j] for j in selected_dataset_indices],
+        device,
     )
-    start_epoch = checkpoint["epoch"] + 1
-    fafmodule.model.load_state_dict(checkpoint["model_state_dict"])
-    fafmodule.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    fafmodule.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    with torch.no_grad():
+        det_loss, _, _, _ = fafmodule.predict_all(data, batch_size=1, num_agent=1)
+    return det_loss.item()
 
-    print(f"Loaded detection model checkpoint from {args.ckpt} (epoch {start_epoch})")
 
-    # ------------------------------------------------------------------
-    # Build state index (GNSS/IMU)
-    # ------------------------------------------------------------------
-    state_index = StateIndex.from_fs(args.data_state)
+# ── Pre-training cache (Task 3) ────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Build selector policy
-    # ------------------------------------------------------------------
-    # Infer input_dim from first batch/features
-    # Grab one sample from loader to get feature dim
-    sample0 = next(iter(train_loader))
-    (
-        _pvp_list,
-        _pvp_teacher_list,
-        _label_list,
-        _reg_target_list,
-        _reg_loss_mask_list,
-        _anchors_list,
-        _vis_maps_list,
-        _gt_max_iou,
-        filenames0,
-        _target_agent_id_list0,
-        _num_agent_list0,
-        _trans_mats_list0,
-    ) = zip(*sample0)
+def build_frame_cache(
+    loader: DataLoader,
+    state_index: StateIndex,
+    fafmodule: FaFModule,
+    config,
+    device: torch.device,
+) -> dict:
+    """
+    Iterate all training frames once and cache, for each frame:
+      - q_lower  : detector quality (-loss) with only the nearest single agent
+      - q_upper  : detector quality (-loss) with all agents
+      - features : (N, 12) float32 tensor (pre-built state features)
+      - N        : number of available agents
+    Returns dict keyed by (scene_id, frame_id).
+    """
+    aid_to_didx = _agent_id_to_dataset_idx()
+    cache = {}
+    print("Building pre-training cache (q_lower / q_upper)…")
+    fafmodule.model.eval()
 
-    first_fname = filenames0[0][0][0]
-    parts = first_fname.split(os.sep)
-    scene_frame = parts[-2]  # e.g. "12_5"
-    scene_id, frame_id = map(int, scene_frame.split("_"))
+    for batch in tqdm(loader, desc="Cache"):
+        (
+            pvp_list,
+            pvp_teacher_list,
+            label_list,
+            reg_target_list,
+            reg_loss_mask_list,
+            anchors_list,
+            vis_maps_list,
+            _gt_max_iou,
+            filenames,
+            target_agent_id_list,
+            num_agent_list,
+            trans_matrices_list,
+        ) = zip(*batch)
 
-    state_feats0, _ = build_state_features(
-        state_index=state_index,
-        scene_id=scene_id,
-        frame_id=frame_id,
-        return_meta=True,
+        pvp_list = list(pvp_list)
+        pvp_teacher_list = list(pvp_teacher_list)
+        label_list = list(label_list)
+        reg_target_list = list(reg_target_list)
+        reg_loss_mask_list = list(reg_loss_mask_list)
+        anchors_list = list(anchors_list)
+        vis_maps_list = list(vis_maps_list)
+        target_agent_id_list = list(target_agent_id_list)
+        num_agent_list = list(num_agent_list)
+
+        filename0 = filenames[0][0][0]
+        parts = filename0.split(os.sep)
+        scene_id, frame_id = map(int, parts[-2].split("_"))
+
+        ml_feats, metas = build_state_features(
+            state_index, scene_id, frame_id, return_meta=True
+        )                                            # (N, 12) engineered
+        if ml_feats.shape[0] == 0:
+            continue
+
+        # Map feature rows → dataset indices
+        feat_to_didx = [aid_to_didx.get(m.agent_id) for m in metas]
+        valid_pairs = [(fi, di) for fi, di in enumerate(feat_to_didx) if di is not None]
+        if not valid_pairs:
+            continue
+
+        trans_table = _ref_table_to_trans(trans_matrices_list)
+        all_dataset_indices = list(range(len(AGENT_IDX_RANGE)))
+
+        # q_upper: all agents
+        try:
+            loss_upper = _run_detector(
+                fafmodule, config, all_dataset_indices,
+                pvp_list, pvp_teacher_list, label_list, reg_target_list,
+                reg_loss_mask_list, anchors_list, vis_maps_list,
+                target_agent_id_list, num_agent_list, trans_table, device,
+            )
+        except Exception:
+            continue
+
+        # q_lower: nearest single agent (normalised range = ml_feats[:, 2])
+        nearest_feat_idx = int(ml_feats[:, 2].argmin().item())
+        nearest_dataset_idx = feat_to_didx[nearest_feat_idx]
+        if nearest_dataset_idx is None:
+            nearest_dataset_idx = valid_pairs[0][1]
+        try:
+            loss_lower = _run_detector(
+                fafmodule, config, [nearest_dataset_idx],
+                pvp_list, pvp_teacher_list, label_list, reg_target_list,
+                reg_loss_mask_list, anchors_list, vis_maps_list,
+                target_agent_id_list, num_agent_list, trans_table, device,
+            )
+        except Exception:
+            loss_lower = loss_upper
+
+        cache[(scene_id, frame_id)] = {
+            "q_lower": -loss_lower,
+            "q_upper": -loss_upper,
+            "features": ml_feats,       # (N, 12) engineered ML features
+            "feat_to_didx": feat_to_didx,
+            "N": ml_feats.shape[0],
+        }
+
+    print(f"Cache built: {len(cache)} frames.")
+    return cache
+
+
+# ── Checkpoint helpers (Task 5) ────────────────────────────────────────────────
+
+def _save_checkpoint(path: str, state: dict) -> None:
+    """Atomic checkpoint write: write to .tmp then rename."""
+    tmp = path + ".tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def _load_checkpoint(path: str, selector, optimizer) -> tuple:
+    """Load checkpoint. Returns (start_epoch, ema_mean, ema_var, best_val_map)."""
+    ckpt = torch.load(path, map_location="cpu")
+    selector.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    return (
+        ckpt["epoch"] + 1,
+        ckpt["ema_mean"],
+        ckpt["ema_var"],
+        ckpt["best_val_map"],
     )
-    input_dim = state_feats0.shape[1]
-
-    selector = AgentSelectorMLP(input_dim=input_dim, hidden_dim=args.selector_hidden_dim).to(device)
-    optimizer = torch.optim.Adam(selector.parameters(), lr=args.lr)
-
-    # Baseline for REINFORCE (EMA of reward)
-    baseline = 0.0
-    beta = args.reward_baseline_momentum
-    frame_logs: List[dict] = []
-    loss_history: List[float] = []
-    reward_history: List[float] = []
-    frame_counter = 0
-
-    # ------------------------------------------------------------------
-    # RL training loop (per-frame bandit)
-    # ------------------------------------------------------------------
-    print("Starting RL training of selector...")
-    for epoch in range(args.epochs):
-        selector.train()
-        total_loss = 0.0
-        total_frames = 0
-
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            (
-                padded_voxel_point_list,
-                padded_voxel_points_teacher_list,
-                label_one_hot_list,
-                reg_target_list,
-                reg_loss_mask_list,
-                anchors_map_list,
-                vis_maps_list,
-                gt_max_iou,
-                filenames,
-                target_agent_id_list,
-                num_agent_list,
-                trans_matrices_list,
-            ) = zip(*batch)
-
-            # --- build state features ---
-            filename0 = filenames[0][0][0]
-            parts = filename0.split(os.sep)
-            scene_frame = parts[-2]  # e.g. "12_5"
-            scene_id, frame_id = map(int, scene_frame.split("_"))
-
-            state_feats, metas = build_state_features(
-                state_index=state_index,
-                scene_id=scene_id,
-                frame_id=frame_id,
-                return_meta=True,
-            )
-            state_feats = state_feats.to(device)  # (N, D)
-            available_agent_ids = [m.agent_id for m in metas]
-
-            padded_voxel_point_list = list(padded_voxel_point_list)
-            padded_voxel_points_teacher_list = list(padded_voxel_points_teacher_list)
-            label_one_hot_list = list(label_one_hot_list)
-            reg_target_list = list(reg_target_list)
-            reg_loss_mask_list = list(reg_loss_mask_list)
-            anchors_map_list = list(anchors_map_list)
-            vis_maps_list = list(vis_maps_list)
-            target_agent_id_list = list(target_agent_id_list)
-            num_agent_list = list(num_agent_list)
-            trans_matrices_list = list(trans_matrices_list)
-
-            # --- policy: logits -> probs -> Bernoulli sample ---
-            logits = selector(state_feats)           # (N,)
-            probs = torch.sigmoid(logits)            # (N,)
-            m = torch.distributions.Bernoulli(probs)
-            actions = m.sample()                     # (N,)
-            log_probs = m.log_prob(actions)          # (N,)
-
-            #selected_indices = actions.nonzero(as_tuple=True)[0].cpu().tolist()
-            selected_indices = [i for i in range(len(actions))] # temporary: select all agents
-            num_selected = len(selected_indices)
-            selected_agent_ids = [available_agent_ids[i] for i in selected_indices]
-            det_loss_value = None
-
-            if num_selected > 0:
-                # --- filter detection inputs according to selected agents ---
-                def _sel(lst):
-                    return [lst[i] for i in selected_indices]
-
-                pvp_list_sel = _sel(padded_voxel_point_list)
-                pvp_teacher_list_sel = _sel(padded_voxel_points_teacher_list)
-                label_list_sel = _sel(label_one_hot_list)
-                reg_target_list_sel = _sel(reg_target_list)
-                reg_loss_mask_list_sel = _sel(reg_loss_mask_list)
-                anchors_list_sel = _sel(anchors_map_list)
-                vis_maps_list_sel = _sel(vis_maps_list)
-                target_agent_id_list_sel = _sel(target_agent_id_list)
-                num_agent_list_sel = _sel(num_agent_list)
-                trans_mats_list_sel = _sel(trans_matrices_list)
-
-                # Fuse the post-selection agents using the same alignment and voxelization
-                # used by create_data_det so detector inputs only contain chosen data.
-                data = assemble_detection_inputs(
-                    config,
-                    pvp_list_sel,
-                    pvp_teacher_list_sel,
-                    label_list_sel,
-                    reg_target_list_sel,
-                    reg_loss_mask_list_sel,
-                    anchors_list_sel,
-                    vis_maps_list_sel,
-                    target_agent_id_list_sel,
-                    num_agent_list_sel,
-                    trans_mats_list_sel,
-                    device,
-                )
-
-                # --- run detection model (frozen) ---
-                with torch.no_grad():
-                    det_loss, cls_loss, loc_loss, result = fafmodule.predict_all(
-                        data, batch_size=1, num_agent=num_selected
-                    )
-
-                # reward: lower loss is better; penalize number of selected agents
-                det_loss_value = float(det_loss)
-                reward_value = -det_loss_value - args.lambda_cost * float(num_selected)
-            else:
-                # no agents selected
-                reward_value = -10000.0
-
-            # update baseline
-            baseline = beta * baseline + (1.0 - beta) * reward_value
-            advantage = reward_value - baseline
-
-            # --- RL loss (frame-level REINFORCE) ---
-            # sum log_probs over all agents in this frame
-            log_prob_sum = log_probs.sum()
-
-            loss = -log_prob_sum * torch.tensor(advantage, device=device)
-
-            loss_value = float(loss.item())
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            # frame-level logging
-            loss_history.append(loss_value)
-            reward_history.append(float(reward_value))
-            frame_logs.append(
-                {
-                    "epoch": epoch + 1,
-                    "frame_global_index": frame_counter,
-                    "scene_id": scene_id,
-                    "frame_id": frame_id,
-                    "available_agent_ids": available_agent_ids,
-                    "selected_indices": selected_indices,
-                    "selected_agent_ids": selected_agent_ids,
-                    "num_selected": num_selected,
-                    "num_available": len(available_agent_ids),
-                    "reward": float(reward_value),
-                    "loss": loss_value,
-                    "det_loss": det_loss_value,
-                    "actions": actions.detach().cpu().int().tolist(),
-                    "probs": probs.detach().cpu().tolist(),
-                }
-            )
-            frame_counter += 1
-
-            total_loss += loss_value
-            total_frames += 1
 
 
-        avg_loss = total_loss / max(1, total_frames)
-        print(f"[Epoch {epoch+1}/{args.epochs}] RL loss per frame: {avg_loss:.4f}")
-
-    # ------------------------------------------------------------------
-    # Persist logs and plots
-    # ------------------------------------------------------------------
-    metrics_path = os.path.join(log_dir, "metrics.json")
-    frame_logs_path = os.path.join(log_dir, "frame_logs.json")
-    plots = {}
-
-    if frame_logs:
-        frame_indices = [log["frame_global_index"] for log in frame_logs]
-
-        # Agent selection scatter plot
-        plt.figure(figsize=(10, 5))
-        x_points = []
-        y_points = []
-        x_none = []
-        for log in frame_logs:
-            if log["selected_agent_ids"]:
-                x_points.extend([log["frame_global_index"]] * len(log["selected_agent_ids"]))
-                y_points.extend(log["selected_agent_ids"])
-            else:
-                x_none.append(log["frame_global_index"])
-        if x_points:
-            plt.scatter(x_points, y_points, s=14, alpha=0.7, label="Selected agents")
-        if x_none:
-            plt.scatter(x_none, [0] * len(x_none), marker="x", color="red", alpha=0.6, label="No agents selected")
-        plt.xlabel("Frame")
-        plt.ylabel("Agent ID (0 marks no selection)")
-        plt.title("Agent selections per frame")
-        plt.grid(True, linestyle="--", alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        selections_plot_path = os.path.join(log_dir, "agent_selections.png")
-        plt.savefig(selections_plot_path, dpi=200)
-        plt.close()
-        plots["agent_selections"] = selections_plot_path
-
-        # Loss and reward curves
-        plt.figure(figsize=(10, 5))
-        plt.plot(frame_indices, loss_history, label="RL loss")
-        plt.plot(frame_indices, reward_history, label="Reward")
-        plt.xlabel("Frame")
-        plt.ylabel("Value")
-        plt.title("RL loss and reward per frame")
-        plt.grid(True, linestyle="--", alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        lr_plot_path = os.path.join(log_dir, "loss_reward.png")
-        plt.savefig(lr_plot_path, dpi=200)
-        plt.close()
-        plots["loss_reward"] = lr_plot_path
-
-    with open(frame_logs_path, "w") as f:
-        json.dump(frame_logs, f, indent=2)
-
-    run_metadata = {
-        "experiment_name": exp_name,
-        "log_dir": log_dir,
-        "num_frames": len(frame_logs),
-        "args": vars(args),
-        "plots": plots,
-        "loss_history": loss_history,
-        "reward_history": reward_history,
+def _checkpoint_state(epoch, selector, optimizer, ema_mean, ema_var, best_val_map):
+    return {
+        "epoch": epoch,
+        "model": selector.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "ema_mean": ema_mean,
+        "ema_var": ema_var,
+        "best_val_map": best_val_map,
     }
-    with open(metrics_path, "w") as f:
-        json.dump(run_metadata, f, indent=2)
-    print(f"Saved frame logs and plots to {log_dir}")
 
-    # ------------------------------------------------------------------
-    # Save trained selector
-    # ------------------------------------------------------------------
-    torch.save(selector.state_dict(), args.save_path)
-    print(f"Saved RL selector to {args.save_path}")
+
+# ── REINFORCE epoch (Task 4) ───────────────────────────────────────────────────
+
+def run_train_epoch(
+    epoch: int,
+    selector: AgentSelectorMLP,
+    optimizer,
+    loader: DataLoader,
+    frame_cache: dict,
+    state_index: StateIndex,
+    fafmodule: FaFModule,
+    config,
+    device: torch.device,
+    ema_mean: float,
+    ema_var: float,
+    lambda_cost: float,
+    frames_per_epoch: int = 0,
+):
+    selector.train()
+    fafmodule.model.eval()
+
+    aid_to_didx = _agent_id_to_dataset_idx()
+
+    total_loss = 0.0
+    total_entropy = 0.0
+    total_reward = 0.0
+    total_n_sel = 0.0
+    n_frames = 0
+
+    bar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
+    for batch in bar:
+        if frames_per_epoch > 0 and n_frames >= frames_per_epoch:
+            break
+
+        (
+            pvp_list,
+            pvp_teacher_list,
+            label_list,
+            reg_target_list,
+            reg_loss_mask_list,
+            anchors_list,
+            vis_maps_list,
+            _gt_max_iou,
+            filenames,
+            target_agent_id_list,
+            num_agent_list,
+            trans_matrices_list,
+        ) = zip(*batch)
+
+        pvp_list = list(pvp_list)
+        pvp_teacher_list = list(pvp_teacher_list)
+        label_list = list(label_list)
+        reg_target_list = list(reg_target_list)
+        reg_loss_mask_list = list(reg_loss_mask_list)
+        anchors_list = list(anchors_list)
+        vis_maps_list = list(vis_maps_list)
+        target_agent_id_list = list(target_agent_id_list)
+        num_agent_list = list(num_agent_list)
+
+        filename0 = filenames[0][0][0]
+        parts = filename0.split(os.sep)
+        scene_id, frame_id = map(int, parts[-2].split("_"))
+
+        cached = frame_cache.get((scene_id, frame_id))
+        if cached is None:
+            continue
+
+        features = cached["features"].to(device)        # (N, 12)
+        q_lower = cached["q_lower"]
+        q_upper = cached["q_upper"]
+        feat_to_didx = cached["feat_to_didx"]
+        N = cached["N"]
+
+        # ── Policy: logits → probs → Bernoulli sample ──────────────────────────
+        logits = selector(features)                     # (N,)
+        probs = torch.sigmoid(logits)                   # (N,)
+        a = Bernoulli(probs).sample()                   # (N,)
+
+        # Guarantee at least one agent
+        if a.sum() == 0:
+            a[probs.argmax()] = 1.0
+
+        selected_feat_indices = a.nonzero(as_tuple=True)[0].tolist()
+        selected_dataset_indices = [
+            feat_to_didx[i]
+            for i in selected_feat_indices
+            if feat_to_didx[i] is not None
+        ]
+        if not selected_dataset_indices:
+            # No valid mapping — keep the closest agent
+            selected_dataset_indices = [feat_to_didx[0] or 0]
+
+        # ── Frozen detector (no grad for detection) ───────────────────────────
+        try:
+            trans_table = _ref_table_to_trans(trans_matrices_list)
+            det_loss_val = _run_detector(
+                fafmodule, config, selected_dataset_indices,
+                pvp_list, pvp_teacher_list, label_list, reg_target_list,
+                reg_loss_mask_list, anchors_list, vis_maps_list,
+                target_agent_id_list, num_agent_list, trans_table, device,
+            )
+        except Exception as exc:
+            print(f"  Detector error (scene {scene_id} frame {frame_id}): {exc}")
+            continue
+
+        # ── Reward computation ─────────────────────────────────────────────────
+        q = -det_loss_val
+        q_norm = (q - q_lower) / (q_upper - q_lower + 1e-6)
+        cost_norm = len(selected_dataset_indices) / N_MAX
+        reward = q_norm - lambda_cost * cost_norm
+
+        # EMA variance-reduced baseline
+        ema_mean = 0.95 * ema_mean + 0.05 * reward
+        ema_var = 0.95 * ema_var + 0.05 * (reward - ema_mean) ** 2
+        advantage = (reward - ema_mean) / (ema_var ** 0.5 + 1e-6)
+
+        # ── Policy gradient + entropy bonus ───────────────────────────────────
+        log_probs = (
+            a * torch.log(probs + 1e-8) + (1 - a) * torch.log(1 - probs + 1e-8)
+        )
+        entropy = -(
+            probs * torch.log(probs + 1e-8)
+            + (1 - probs) * torch.log(1 - probs + 1e-8)
+        ).sum()
+        loss = -(log_probs.sum() * advantage) - 0.05 * entropy
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # ── Accumulate metrics ────────────────────────────────────────────────
+        total_loss += loss.item()
+        total_entropy += entropy.item()
+        total_reward = 0.95 * total_reward + 0.05 * reward  # EMA for display
+        total_n_sel += len(selected_dataset_indices)
+        n_frames += 1
+
+        bar.set_postfix(
+            R=f"{ema_mean:.3f}",
+            loss=f"{loss.item():.3f}",
+            H=f"{entropy.item():.2f}",
+            n_bar=f"{len(selected_dataset_indices)}",
+        )
+
+    if n_frames == 0:
+        return ema_mean, ema_var, {}
+
+    metrics = {
+        "avg_loss": total_loss / n_frames,
+        "avg_entropy": total_entropy / n_frames,
+        "ema_reward": ema_mean,
+        "avg_n_selected": total_n_sel / n_frames,
+    }
+    return ema_mean, ema_var, metrics
+
+
+# ── Validation (Task 6) ───────────────────────────────────────────────────────
+
+@torch.no_grad()
+def run_validation(
+    selector: AgentSelectorMLP,
+    val_loader: DataLoader,
+    state_index: StateIndex,
+    fafmodule: FaFModule,
+    config,
+    device: torch.device,
+    threshold: float = 0.5,
+) -> float:
+    """
+    Greedy policy (probs > threshold) on val frames. Returns mAP@0.5.
+    """
+    from copy import deepcopy
+    selector.eval()
+    fafmodule.model.eval()
+
+    aid_to_didx = _agent_id_to_dataset_idx()
+    det_results_all = []
+    annotations_all = []
+
+    for batch in tqdm(val_loader, desc="Validation", leave=False):
+        (
+            pvp_list,
+            pvp_teacher_list,
+            label_list,
+            reg_target_list,
+            reg_loss_mask_list,
+            anchors_list,
+            vis_maps_list,
+            gt_max_iou,
+            filenames,
+            target_agent_id_list,
+            num_agent_list,
+            trans_matrices_list,
+        ) = zip(*batch)
+
+        pvp_list = list(pvp_list)
+        pvp_teacher_list = list(pvp_teacher_list)
+        label_list = list(label_list)
+        reg_target_list = list(reg_target_list)
+        reg_loss_mask_list = list(reg_loss_mask_list)
+        anchors_list = list(anchors_list)
+        vis_maps_list = list(vis_maps_list)
+        target_agent_id_list = list(target_agent_id_list)
+        num_agent_list = list(num_agent_list)
+
+        filename0 = filenames[0][0][0]
+        parts = filename0.split(os.sep)
+        scene_id, frame_id = map(int, parts[-2].split("_"))
+
+        ml_feats, metas = build_state_features(
+            state_index, scene_id, frame_id, return_meta=True
+        )                                             # (N, 12) engineered
+        if ml_feats.shape[0] == 0:
+            continue
+
+        ml_feats = ml_feats.to(device)
+        feat_to_didx = [aid_to_didx.get(m.agent_id) for m in metas]
+
+        # Greedy selection
+        probs = torch.sigmoid(selector(ml_feats))
+        sel_feat = (probs > threshold).nonzero(as_tuple=True)[0].tolist()
+        if not sel_feat:
+            sel_feat = [int(probs.argmax())]
+
+        sel_dataset = [feat_to_didx[i] for i in sel_feat if feat_to_didx[i] is not None]
+        if not sel_dataset:
+            sel_dataset = [0]
+
+        trans_table = _ref_table_to_trans(trans_matrices_list)
+
+        try:
+            def _sel(lst, idxs):
+                return [lst[i] for i in idxs]
+
+            data = assemble_detection_inputs(
+                config,
+                _sel(pvp_list, sel_dataset),
+                _sel(pvp_teacher_list, sel_dataset),
+                _sel(label_list, sel_dataset),
+                _sel(reg_target_list, sel_dataset),
+                _sel(reg_loss_mask_list, sel_dataset),
+                _sel(anchors_list, sel_dataset),
+                _sel(vis_maps_list, sel_dataset),
+                _sel(target_agent_id_list, sel_dataset),
+                _sel(num_agent_list, sel_dataset),
+                [trans_table[j] for j in sel_dataset],
+                device,
+            )
+            _, _, _, result = fafmodule.predict_all(data, batch_size=1, num_agent=1)
+        except Exception:
+            continue
+
+        # Accumulate detection results for mAP
+        padded_voxel_points = data["bev_seq"]
+        reg_target = data["reg_targets"]
+        anchors_map = data["anchors"]
+
+        gt = gt_max_iou[0]
+        if len(gt[0]["gt_box"]) == 0:
+            gt_boxes = []
+        else:
+            gt_boxes = gt[0]["gt_box"][0, :, :]
+
+        temp = {
+            "bev_seq": padded_voxel_points[0, -1].cpu().numpy(),
+            "result": [] if len(result[0]) == 0 else result[0][0],
+            "reg_targets": reg_target.cpu().numpy()[0],
+            "anchors_map": anchors_map.cpu().numpy()[0],
+            "gt_max_iou": gt_boxes,
+        }
+        det_results_all, annotations_all = cal_local_mAP(
+            config, temp, det_results_all, annotations_all
+        )
+
+    if not det_results_all:
+        return 0.0
+
+    try:
+        mean_ap, _ = eval_map(
+            det_results_all,
+            annotations_all,
+            scale_ranges=None,
+            iou_thr=0.5,
+            dataset=None,
+            logger=None,
+        )
+        return float(mean_ap)
+    except Exception:
+        return 0.0
+
+
+# ── Dataset helpers ────────────────────────────────────────────────────────────
+
+def _build_dataset(data_dir: str, config, config_global, scene_begin: int, scene_end: int):
+    dataset = V2XSimDet(
+        dataset_roots=[
+            os.path.join(data_dir, f"agent{i}") for i in AGENT_IDX_RANGE
+        ],
+        config=config,
+        config_global=config_global,
+        split="val",
+        val=True,
+        bound="lowerbound",
+        kd_flag=False,
+        rsu=False,
+    )
+    # Replace multiprocessing Manager cache with fast plain dicts
+    dataset.cache = [{} for _ in range(dataset.num_agent)]
+
+    # Filter to requested scene range
+    scene_of_idx = dataset.seq_scenes[0]
+    keep = [i for i, s in enumerate(scene_of_idx) if scene_begin <= s < scene_end]
+    if not keep:
+        raise RuntimeError(
+            f"No frames in scene range [{scene_begin}, {scene_end}). "
+            f"Scenes in dataset: {sorted(set(scene_of_idx))}"
+        )
+    return Subset(dataset, keep)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # ── Scene range disjointness check ────────────────────────────────────────
+    test_scenes = {5, 8, 19, 27, 28, 29, 91, 92, 96, 97}
+    train_set = set(range(args.train_scene_begin, args.train_scene_end))
+    val_set = set(range(args.val_scene_begin, args.val_scene_end))
+    overlap_tv = train_set & val_set
+    overlap_ttest = train_set & test_scenes
+    overlap_vtest = val_set & test_scenes
+    print(
+        f"\nScene ranges:"
+        f"\n  Train : [{args.train_scene_begin}, {args.train_scene_end})"
+        f"\n  Val   : [{args.val_scene_begin}, {args.val_scene_end})"
+        f"\n  Test  : {sorted(test_scenes)}"
+    )
+    if overlap_ttest:
+        print(f"  WARNING: train ∩ test = {sorted(overlap_ttest)}")
+    if overlap_vtest:
+        print(f"  WARNING: val ∩ test = {sorted(overlap_vtest)}")
+    if overlap_tv:
+        print(f"  WARNING: train ∩ val = {sorted(overlap_tv)}")
+    print()
+
+    # ── Config ────────────────────────────────────────────────────────────────
+    config = Config("train", binary=True, only_det=True)
+    config.flag = "lowerbound"
+    config_global = ConfigGlobal("train", binary=True, only_det=True)
+
+    # ── Frozen detector ───────────────────────────────────────────────────────
+    fafmodule = _build_fafmodule(config, args.ckpt, device)
+
+    # Save a reference parameter to verify the detector is unchanged after training
+    _det_ref_param = next(fafmodule.model.parameters()).detach().clone()
+
+    # ── Datasets & loaders ───────────────────────────────────────────────────
+    print("Loading train dataset…")
+    train_dataset = _build_dataset(
+        args.data_det, config, config_global,
+        args.train_scene_begin, args.train_scene_end,
+    )
+    train_loader = DataLoader(
+        train_dataset, batch_size=1, shuffle=True, num_workers=args.num_workers
+    )
+    print(f"  Train frames: {len(train_dataset)}")
+
+    val_data_dir = args.data_val or os.path.join(
+        os.path.dirname(args.data_det.rstrip("/\\")) if "/train" not in args.data_det
+        else args.data_det.replace("/train", "/val"),
+        "",
+    )
+    # Simplest fallback: replace last component "train" → "val"
+    if not val_data_dir or not os.path.isdir(val_data_dir):
+        parent = os.path.dirname(args.data_det.rstrip("/\\"))
+        val_data_dir = os.path.join(parent, "val")
+
+    print("Loading val dataset…")
+    try:
+        val_dataset = _build_dataset(
+            val_data_dir, config, config_global,
+            args.val_scene_begin, args.val_scene_end,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=1, shuffle=False, num_workers=args.num_workers
+        )
+        print(f"  Val frames  : {len(val_dataset)}")
+    except Exception as exc:
+        print(f"  WARNING: could not load val dataset ({exc}). Validation disabled.")
+        val_loader = None
+
+    # ── State index ───────────────────────────────────────────────────────────
+    all_scene_ids = set(range(args.train_scene_begin, args.train_scene_end))
+    if val_loader is not None:
+        all_scene_ids |= set(range(args.val_scene_begin, args.val_scene_end))
+    state_index = StateIndex.from_fs(args.data_state, scene_ids=all_scene_ids)
+
+    # ── Selector model ────────────────────────────────────────────────────────
+    selector = AgentSelectorMLP(input_dim=FEATURE_DIM).to(device)
+    optimizer = optim.Adam(selector.parameters(), lr=args.lr)
+
+    # ── Pre-training cache (Task 3) ───────────────────────────────────────────
+    frame_cache = build_frame_cache(
+        train_loader, state_index, fafmodule, config, device
+    )
+
+    # ── Resume from checkpoint if available ───────────────────────────────────
+    last_ckpt = os.path.join(args.save_dir, "selector_last.pth")
+    best_ckpt = os.path.join(args.save_dir, "selector_best.pth")
+    start_epoch = 0
+    ema_mean = 0.0
+    ema_var = 1.0
+    best_val_map = 0.0
+
+    if os.path.isfile(last_ckpt):
+        start_epoch, ema_mean, ema_var, best_val_map = _load_checkpoint(
+            last_ckpt, selector, optimizer
+        )
+        print(f"Resumed from epoch {start_epoch - 1} (best_val_map={best_val_map:.4f})")
+
+    # ── CSV metrics file ──────────────────────────────────────────────────────
+    csv_path = os.path.join(args.save_dir, "train_metrics.csv")
+    csv_file = open(csv_path, "a", newline="")
+    csv_writer = csv.writer(csv_file)
+    if os.path.getsize(csv_path) == 0:
+        csv_writer.writerow(
+            ["epoch", "ema_reward", "loss", "entropy", "avg_n_selected", "val_map"]
+        )
+        csv_file.flush()
+
+    # ── Optional TensorBoard ──────────────────────────────────────────────────
+    tb_writer = None
+    if args.tensorboard:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_writer = SummaryWriter(log_dir=args.save_dir)
+        except ImportError:
+            print("WARNING: tensorboard not installed; --tensorboard ignored.")
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    try:
+        for epoch in range(start_epoch, args.rl_epochs):
+            lambda_cost = 0.0 if epoch < args.curriculum_epochs else args.lambda_cost
+            phase = "curriculum" if epoch < args.curriculum_epochs else "full"
+            print(f"\nEpoch {epoch}/{args.rl_epochs - 1}  λ_cost={lambda_cost}  [{phase}]")
+
+            ema_mean, ema_var, metrics = run_train_epoch(
+                epoch=epoch,
+                selector=selector,
+                optimizer=optimizer,
+                loader=train_loader,
+                frame_cache=frame_cache,
+                state_index=state_index,
+                fafmodule=fafmodule,
+                config=config,
+                device=device,
+                ema_mean=ema_mean,
+                ema_var=ema_var,
+                lambda_cost=lambda_cost,
+                frames_per_epoch=args.frames_per_epoch,
+            )
+
+            # Periodic validation
+            val_map = 0.0
+            if val_loader is not None and (epoch + 1) % args.val_every == 0:
+                print("  Running validation…")
+                val_map = run_validation(
+                    selector, val_loader, state_index, fafmodule,
+                    config, device, threshold=args.sel_threshold,
+                )
+                print(f"  val mAP@0.5 = {val_map:.4f}")
+                if val_map > best_val_map:
+                    best_val_map = val_map
+                    _save_checkpoint(
+                        best_ckpt,
+                        _checkpoint_state(epoch, selector, optimizer, ema_mean, ema_var, best_val_map),
+                    )
+                    print(f"  ✓ New best — saved to {best_ckpt}")
+
+            # tqdm epoch summary
+            avg_loss = metrics.get("avg_loss", float("nan"))
+            avg_ent = metrics.get("avg_entropy", float("nan"))
+            avg_n = metrics.get("avg_n_selected", float("nan"))
+            print(
+                f"  R={ema_mean:.3f}  loss={avg_loss:.3f}  "
+                f"H={avg_ent:.2f}  n̄={avg_n:.2f}  val_mAP={val_map:.4f}"
+            )
+
+            # CSV row
+            csv_writer.writerow([epoch, ema_mean, avg_loss, avg_ent, avg_n, val_map])
+            csv_file.flush()
+
+            # TensorBoard
+            if tb_writer is not None:
+                tb_writer.add_scalar("train/ema_reward", ema_mean, epoch)
+                tb_writer.add_scalar("train/loss", avg_loss, epoch)
+                tb_writer.add_scalar("train/entropy", avg_ent, epoch)
+                tb_writer.add_scalar("train/avg_n_selected", avg_n, epoch)
+                tb_writer.add_scalar("val/mAP_05", val_map, epoch)
+
+            # Save last checkpoint every epoch
+            _save_checkpoint(
+                last_ckpt,
+                _checkpoint_state(epoch, selector, optimizer, ema_mean, ema_var, best_val_map),
+            )
+
+    finally:
+        # Crash-safe: always persist selector_last.pth on exit
+        try:
+            _save_checkpoint(
+                last_ckpt,
+                _checkpoint_state(
+                    start_epoch, selector, optimizer, ema_mean, ema_var, best_val_map
+                ),
+            )
+            print(f"\nProgress saved to {last_ckpt}")
+        except Exception as exc:
+            print(f"WARNING: could not save final checkpoint: {exc}")
+        csv_file.close()
+        if tb_writer is not None:
+            tb_writer.close()
+
+    # ── Verify detector unchanged ─────────────────────────────────────────────
+    _det_ref_param_after = next(fafmodule.model.parameters()).detach()
+    if torch.allclose(_det_ref_param.to(device), _det_ref_param_after):
+        print("✓ Frozen detector weights are unchanged after training.")
+    else:
+        print("WARNING: Detector weights differ — this should not happen!")
+
+    print(f"\nTraining complete. Best val mAP@0.5 = {best_val_map:.4f}")
+    print(f"  selector_best.pth : {best_ckpt}")
+    print(f"  selector_last.pth : {last_ckpt}")
+    print(f"  train_metrics.csv : {csv_path}")
 
 
 if __name__ == "__main__":

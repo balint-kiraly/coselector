@@ -112,13 +112,13 @@ def select_velocity_based(
     Pick the K agents with the highest instantaneous speed.
     Rationale: fast-moving vehicles observe the most scene change per frame
     and provide complementary views not easily predicted from RSU data alone.
-    State feature index 6 = speed.
+    State feature index 11 = speed/V (normalised, build_state_features layout).
     """
     N = state_features.shape[0]
     K = min(K, N)
     if K <= 0:
         return []
-    speeds = state_features[:, 6].detach().cpu().numpy()  # (N,)
+    speeds = state_features[:, 11].detach().cpu().numpy()  # (N,) speed/V
     order = np.argsort(-speeds)   # descending = fastest first
     return order[:K].tolist()
 
@@ -183,23 +183,42 @@ def _angular_dist(a: float, b: float) -> float:
     return min(diff, 2 * math.pi - diff)
 
 
+@torch.no_grad()
+def _select_ml(
+    features: torch.Tensor,
+    model,
+    threshold: float = 0.5,
+    min_agents: int = 1,
+) -> List[int]:
+    """Deterministic greedy selection: sigmoid(logits) > threshold."""
+    probs = torch.sigmoid(model(features)).squeeze(-1)   # (N,)
+    sel = (probs > threshold).nonzero(as_tuple=True)[0].tolist()
+    if len(sel) < min_agents:
+        sel = [int(probs.argmax())]
+    return sel
+
+
 def select_ml_model(
     state_features: torch.Tensor,
     model=None,
     threshold: float = 0.5,
     **kwargs,
 ) -> List[int]:
-    """Use a trained neural model to score and select agents."""
+    """
+    Use a trained MLP policy to select agents.
+
+    ``state_features`` is expected to be the (N, 12) tensor produced by
+    build_state_features — the model was trained on that exact layout.
+
+    Applies sigmoid to the logit outputs and thresholds at ``threshold``
+    (default 0.5).  Sweeping 0.3 / 0.5 / 0.7 produces multiple Pareto points
+    from a single trained model without re-running training.
+
+    Falls back to identity (all agents) when ``model`` is None.
+    """
     if model is None:
-        # Model not available — fall back to identity
         return list(range(state_features.shape[0]))
-    with torch.no_grad():
-        scores = model(state_features)  # (N,)
-    selected = (scores > threshold).nonzero(as_tuple=True)[0].cpu().tolist()
-    # Always keep at least one agent
-    if not selected:
-        selected = [int(scores.argmax().item())]
-    return selected
+    return _select_ml(state_features, model, threshold=threshold)
 
 
 def select_bandwidth_aware(
