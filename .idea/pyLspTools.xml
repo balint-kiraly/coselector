@@ -3,6 +3,11 @@
   <component name="PyToolsState">
     <option name="tools">
       <map>
+        <entry key="pyrefly">
+          <value>
+            <ToolEntry />
+          </value>
+        </entry>
         <entry key="pyright">
           <value>
             <ToolEntry />

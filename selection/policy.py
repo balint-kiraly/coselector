@@ -112,13 +112,14 @@ def select_velocity_based(
     Pick the K agents with the highest instantaneous speed.
     Rationale: fast-moving vehicles observe the most scene change per frame
     and provide complementary views not easily predicted from RSU data alone.
-    State feature index 11 = speed/V (normalised, build_state_features layout).
+    Raw state feature index 6 = speed (m/s) in the (N, 26) build_state_features
+    layout.  Raw fields occupy columns 0-13.
     """
     N = state_features.shape[0]
     K = min(K, N)
     if K <= 0:
         return []
-    speeds = state_features[:, 11].detach().cpu().numpy()  # (N,) speed/V
+    speeds = state_features[:, 6].detach().cpu().numpy()  # (N,) raw speed m/s
     order = np.argsort(-speeds)   # descending = fastest first
     return order[:K].tolist()
 
@@ -207,8 +208,8 @@ def select_ml_model(
     """
     Use a trained MLP policy to select agents.
 
-    ``state_features`` is expected to be the (N, 12) tensor produced by
-    build_state_features — the model was trained on that exact layout.
+    ``state_features`` is the (N, 26) tensor from build_state_features.
+    The engineered 12 features live in columns 14:26 and are fed to the model.
 
     Applies sigmoid to the logit outputs and thresholds at ``threshold``
     (default 0.5).  Sweeping 0.3 / 0.5 / 0.7 produces multiple Pareto points
@@ -218,7 +219,9 @@ def select_ml_model(
     """
     if model is None:
         return list(range(state_features.shape[0]))
-    return _select_ml(state_features, model, threshold=threshold)
+    from data_utils.build_state_features import ML_START
+    ml_feats = state_features[:, ML_START:]   # (N, 12) engineered columns
+    return _select_ml(ml_feats, model, threshold=threshold)
 
 
 def select_bandwidth_aware(

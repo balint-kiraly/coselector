@@ -462,8 +462,9 @@ def main(args):
 
             # ------------------ Agent Selection Model ------------------
             if args.selection and args.sel_method == "ml_model" and cnt == 0:
-                # The ML selector always takes 12 engineered features
-                # (build_selector_features), not the raw 14-field state tensor.
+                # state_feats is (N, 26): raw [0:14] + engineered [14:26].
+                # The MLP is trained on the 12 engineered columns; select_ml_model
+                # slices state_feats[:, 14:] internally.
                 sel_model = AgentSelectorMLP(input_dim=12)
                 sel_model = sel_model.to(device)
                 assert args.sel_model_path is not None, "Path to trained agent selection model is not provided"

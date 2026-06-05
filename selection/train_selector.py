@@ -36,14 +36,14 @@ from coperception.utils.loss import (
 )
 from coperception.utils.mean_ap import eval_map
 
-from data_utils.build_state_features import build_state_features
+from data_utils.build_state_features import build_state_features, ML_START, ML_DIM
 from data_utils.state_index import StateIndex
 from selection.bev_builder import assemble_detection_inputs
 from selection.models import AgentSelectorMLP
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-FEATURE_DIM = 12
+FEATURE_DIM = ML_DIM   # 12 — engineered features fed to the MLP
 AGENT_START = 1
 AGENT_END = 6          # exclusive; vehicles 1-5
 AGENT_IDX_RANGE = range(AGENT_START, AGENT_END)
@@ -215,11 +215,12 @@ def build_frame_cache(
         parts = filename0.split(os.sep)
         scene_id, frame_id = map(int, parts[-2].split("_"))
 
-        ml_feats, metas = build_state_features(
+        feats26, metas = build_state_features(
             state_index, scene_id, frame_id, return_meta=True
-        )                                            # (N, 12) engineered
-        if ml_feats.shape[0] == 0:
+        )                                            # (N, 26) raw + engineered
+        if feats26.shape[0] == 0:
             continue
+        ml_feats = feats26[:, ML_START:]             # (N, 12) engineered slice
 
         # Map feature rows → dataset indices
         feat_to_didx = [aid_to_didx.get(m.agent_id) for m in metas]
@@ -509,13 +510,13 @@ def run_validation(
         parts = filename0.split(os.sep)
         scene_id, frame_id = map(int, parts[-2].split("_"))
 
-        ml_feats, metas = build_state_features(
+        feats26, metas = build_state_features(
             state_index, scene_id, frame_id, return_meta=True
-        )                                             # (N, 12) engineered
-        if ml_feats.shape[0] == 0:
+        )                                             # (N, 26) raw + engineered
+        if feats26.shape[0] == 0:
             continue
 
-        ml_feats = ml_feats.to(device)
+        ml_feats = feats26[:, ML_START:].to(device)  # (N, 12) engineered slice
         feat_to_didx = [aid_to_didx.get(m.agent_id) for m in metas]
 
         # Greedy selection
