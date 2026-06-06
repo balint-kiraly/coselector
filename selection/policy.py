@@ -148,15 +148,23 @@ def select_heuristic(
     **kwargs,
 ) -> List[int]:
     """
-    Greedy angular-coverage selector.
+    Greedy angular-coverage selector with proximity weighting.
 
     Builds a set of K vehicles whose viewing angles (as seen from the RSU)
-    are maximally spread: pick the first vehicle freely, then each subsequent
-    vehicle is the one whose bearing from the RSU is farthest from the
-    already-chosen bearings (max-min angular gap heuristic).
+    are maximally spread: pick the first vehicle freely (closest to RSU),
+    then each subsequent vehicle is chosen to maximise:
 
-    This maximises the spatial diversity of the received point clouds and
-    reduces the chance that all selected vehicles observe the same region.
+        score = min_angular_gap × (1 − normalised_range)
+
+    where normalised_range = dist_to_RSU / lidar_max_range_m, clipped to [0, 1].
+
+    The proximity factor penalises distant candidates: a vehicle at the edge of
+    LiDAR range contributes near-zero dense points over the AOI regardless of
+    how unique its bearing is, so a nearby vehicle at a slightly redundant angle
+    is preferred.  At zero distance the score reduces to the pure angular gap.
+
+    This maximises the spatial diversity of the received point clouds while
+    biasing selection towards vehicles close enough to deliver dense coverage.
     """
     N = state_features.shape[0]
     K = min(K, N)
@@ -185,8 +193,11 @@ def select_heuristic(
             min_ang = min(
                 _angular_dist(bearings[i], bearings[s]) for s in selected
             )
-            if min_ang > best_score:
-                best_score = min_ang
+            # Weight by proximity: distant vehicles open new angles but contribute sparse points.
+            norm_range = min(dists[i] / max(metas[i].lidar_max_range_m, 1.0), 1.0)
+            score = min_ang * (1.0 - norm_range)
+            if score > best_score:
+                best_score = score
                 best_agent = i
         selected.append(best_agent)
         remaining.remove(best_agent)
