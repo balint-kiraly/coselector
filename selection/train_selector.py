@@ -89,6 +89,13 @@ def parse_args():
     p.add_argument("--sel_threshold", type=float, default=0.5,
                    help="Greedy selection threshold used during validation.")
 
+    # cache
+    p.add_argument("--cache_dir", type=str, default="",
+                   help="Directory for persisting pre-training frame caches "
+                        "(q_lower/q_upper/features).  The file is named "
+                        "selector_cache_s{begin}-{end}.pt automatically.  "
+                        "Leave empty to disable persistence.")
+
     # logging
     p.add_argument("--tensorboard", action="store_true",
                    help="Log scalars to TensorBoard in save_dir.")
@@ -160,7 +167,7 @@ def _run_detector(fafmodule, config, selected_dataset_indices,
     )
     with torch.no_grad():
         det_loss, _, _, _ = fafmodule.predict_all(data, batch_size=1, num_agent=1)
-    return det_loss.item()
+    return det_loss  # predict_all already returns loss.item() — a Python float
 
 
 # ── Pre-training cache (Task 3) ────────────────────────────────────────────────
@@ -266,6 +273,13 @@ def build_frame_cache(
         }
 
     print(f"Cache built: {len(cache)} frames.")
+    if cache:
+        spans = [v["q_upper"] - v["q_lower"] for v in cache.values()]
+        spans.sort()
+        n = len(spans)
+        print(f"  q_upper-q_lower span: min={spans[0]:.4f}  "
+              f"p25={spans[n//4]:.4f}  median={spans[n//2]:.4f}  "
+              f"p75={spans[3*n//4]:.4f}  max={spans[-1]:.4f}")
     return cache
 
 
@@ -327,6 +341,8 @@ def run_train_epoch(
     total_loss = 0.0
     total_entropy = 0.0
     total_reward = 0.0
+    total_q_norm = 0.0
+    total_cost_norm = 0.0
     total_n_sel = 0.0
     n_frames = 0
 
@@ -408,7 +424,15 @@ def run_train_epoch(
 
         # ── Reward computation ─────────────────────────────────────────────────
         q = -det_loss_val
-        q_norm = (q - q_lower) / (q_upper - q_lower + 1e-6)
+        # Guard against near-zero span (q_upper ≈ q_lower).  When the fused-BEV
+        # pipeline produces similar losses for all selections the raw span can be
+        # tiny, turning the 1e-6 floor into a ×10^6 amplifier.  We enforce a
+        # minimum span of MIN_SPAN (expressed as a fraction of |q_lower|) and
+        # then hard-clip q_norm so a single bad frame can never derail the EMA.
+        _MIN_SPAN = max(abs(q_lower) * 0.05, 1e-2)
+        _span = max(q_upper - q_lower, _MIN_SPAN)
+        q_norm = (q - q_lower) / _span
+        q_norm = max(min(q_norm, 1.0), 0.0)    # clip to [0, 1]: 0=worst, 1=best
         cost_norm = len(selected_dataset_indices) / N_MAX
         reward = q_norm - lambda_cost * cost_norm
 
@@ -434,12 +458,16 @@ def run_train_epoch(
         # ── Accumulate metrics ────────────────────────────────────────────────
         total_loss += loss.item()
         total_entropy += entropy.item()
-        total_reward = 0.95 * total_reward + 0.05 * reward  # EMA for display
+        total_reward += reward
+        total_q_norm += q_norm
+        total_cost_norm += cost_norm
         total_n_sel += len(selected_dataset_indices)
         n_frames += 1
 
         bar.set_postfix(
-            R=f"{ema_mean:.3f}",
+            R=f"{reward:.2f}",
+            q=f"{q_norm:.2f}",
+            c=f"{cost_norm:.2f}",
             loss=f"{loss.item():.3f}",
             H=f"{entropy.item():.2f}",
             n_bar=f"{len(selected_dataset_indices)}",
@@ -451,7 +479,9 @@ def run_train_epoch(
     metrics = {
         "avg_loss": total_loss / n_frames,
         "avg_entropy": total_entropy / n_frames,
-        "ema_reward": ema_mean,
+        "avg_reward": total_reward / n_frames,
+        "avg_q_norm": total_q_norm / n_frames,
+        "avg_cost_norm": total_cost_norm / n_frames,
         "avg_n_selected": total_n_sel / n_frames,
     }
     return ema_mean, ema_var, metrics
@@ -566,7 +596,7 @@ def run_validation(
 
         temp = {
             "bev_seq": padded_voxel_points[0, -1].cpu().numpy(),
-            "result": [] if len(result[0]) == 0 else result[0][0],
+            "result": [] if len(result[0]) == 0 else result[0][0][0],
             "reg_targets": reg_target.cpu().numpy()[0],
             "anchors_map": anchors_map.cpu().numpy()[0],
             "gt_max_iou": gt_boxes,
@@ -631,7 +661,7 @@ def main():
     print(f"Device: {device}")
 
     # ── Scene range disjointness check ────────────────────────────────────────
-    test_scenes = {5, 8, 19, 27, 28, 29, 91, 92, 96, 97}
+    test_scenes = { 1, 3, 4, 63, 65, 68, 76, 78, 79, 84 }
     train_set = set(range(args.train_scene_begin, args.train_scene_end))
     val_set = set(range(args.val_scene_begin, args.val_scene_end))
     overlap_tv = train_set & val_set
@@ -708,9 +738,29 @@ def main():
     optimizer = optim.Adam(selector.parameters(), lr=args.lr)
 
     # ── Pre-training cache (Task 3) ───────────────────────────────────────────
-    frame_cache = build_frame_cache(
-        train_loader, state_index, fafmodule, config, device
+    # File is named selector_cache_s{begin}-{end}.pt inside the given directory.
+    cache_file = (
+        os.path.join(
+            args.cache_dir,
+            f"selector_cache_s{args.train_scene_begin}-{args.train_scene_end}.pt",
+        )
+        if args.cache_dir else ""
     )
+
+    cache_loaded = False
+    if cache_file and os.path.isfile(cache_file):
+        print(f"Loading frame cache from {cache_file} …")
+        frame_cache = torch.load(cache_file, map_location="cpu")
+        print(f"Cache loaded: {len(frame_cache)} frames.")
+        cache_loaded = True
+    else:
+        frame_cache = build_frame_cache(
+            train_loader, state_index, fafmodule, config, device
+        )
+        if cache_file and len(frame_cache) > 0:
+            os.makedirs(os.path.dirname(os.path.abspath(cache_file)), exist_ok=True)
+            torch.save(frame_cache, cache_file)
+            print(f"Frame cache saved to {cache_file}")
 
     # ── Resume from checkpoint if available ───────────────────────────────────
     last_ckpt = os.path.join(args.save_dir, "selector_last.pth")
@@ -732,7 +782,7 @@ def main():
     csv_writer = csv.writer(csv_file)
     if os.path.getsize(csv_path) == 0:
         csv_writer.writerow(
-            ["epoch", "ema_reward", "loss", "entropy", "avg_n_selected", "val_map"]
+            ["epoch", "avg_reward", "avg_q_norm", "avg_cost_norm", "loss", "entropy", "avg_n_selected", "val_map"]
         )
         csv_file.flush()
 
@@ -789,18 +839,24 @@ def main():
             avg_loss = metrics.get("avg_loss", float("nan"))
             avg_ent = metrics.get("avg_entropy", float("nan"))
             avg_n = metrics.get("avg_n_selected", float("nan"))
+            avg_r = metrics.get("avg_reward", float("nan"))
+            avg_q = metrics.get("avg_q_norm", float("nan"))
+            avg_c = metrics.get("avg_cost_norm", float("nan"))
             print(
-                f"  R={ema_mean:.3f}  loss={avg_loss:.3f}  "
-                f"H={avg_ent:.2f}  n̄={avg_n:.2f}  val_mAP={val_map:.4f}"
+                f"  R={avg_r:.3f}  q={avg_q:.3f}  c={avg_c:.3f}  "
+                f"loss={avg_loss:.3f}  H={avg_ent:.2f}  n̄={avg_n:.2f}  "
+                f"val_mAP={val_map:.4f}"
             )
 
             # CSV row
-            csv_writer.writerow([epoch, ema_mean, avg_loss, avg_ent, avg_n, val_map])
+            csv_writer.writerow([epoch, avg_r, avg_q, avg_c, avg_loss, avg_ent, avg_n, val_map])
             csv_file.flush()
 
             # TensorBoard
             if tb_writer is not None:
-                tb_writer.add_scalar("train/ema_reward", ema_mean, epoch)
+                tb_writer.add_scalar("train/reward", avg_r, epoch)
+                tb_writer.add_scalar("train/q_norm", avg_q, epoch)
+                tb_writer.add_scalar("train/cost_norm", avg_c, epoch)
                 tb_writer.add_scalar("train/loss", avg_loss, epoch)
                 tb_writer.add_scalar("train/entropy", avg_ent, epoch)
                 tb_writer.add_scalar("train/avg_n_selected", avg_n, epoch)

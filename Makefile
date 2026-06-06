@@ -1,4 +1,5 @@
-.PHONY: create_data test test_identity_rsu test_rsu_only test_late_fusion_rsu train_rsu_centric
+.PHONY: create_data test test_identity_rsu test_rsu_only test_late_fusion_rsu train_rsu_centric \
+        train_selector train_selector_smoke
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # V2X-Sim-2 raw dataset root
@@ -7,10 +8,10 @@ original_data_path     := /mnt/10TB/balintkiraly/data/data/V2X-Sim-2
 create_bev_data_save_path  := /mnt/10TB/balintkiraly/created_data/V2X-Sim-det
 # Preprocessed state-feature JSON tree (output of create_data)
 create_state_data_save_path := /mnt/10TB/balintkiraly/created_data/V2X-Sim-States
-# Pretrained FaFNet checkpoints
+# Pretrained checkpoints
 checkpoint_path        := /mnt/10TB/balintkiraly/checkpoints
 # Evaluation result logs
-log_path               := /mnt/10TB/balintkiraly/results
+results_path               := /mnt/10TB/balintkiraly/results
 # Fine-tuned RSU-centric checkpoint output
 rsu_ckpt_save          := /mnt/10TB/balintkiraly/checkpoints/rsu_centric
 
@@ -45,6 +46,22 @@ batch_size   := 4
 min_agents   := 1
 max_agents   := 5
 train_patience := 7
+
+# ── Selector training parameters ──────────────────────────────────────────────
+selector_save_dir          := $(results_path)/selector
+selector_rl_epochs         := 20
+selector_curriculum_epochs := 3
+selector_lambda_cost       := 0.4
+selector_lr                := 1e-3
+selector_val_every         := 3
+selector_frames_per_epoch  := 30   # smoke test only
+# Directory for pre-training frame caches (q_lower/q_upper/features).
+# The script names each file selector_cache_s{begin}-{end}.pt automatically.
+# Delete the relevant file to force a rebuild (e.g. after swapping the detector ckpt).
+selector_cache_dir         := /mnt/10TB/balintkiraly/created_data/selector_cache
+# Path to a trained selector checkpoint; used by test_codet_selector sel_method=ml_model
+sel_model_path := $(selector_save_dir)/selector_best.pth
+sel_threshold  := 0.5
 
 
 # ── Targets ───────────────────────────────────────────────────────────────────
@@ -88,7 +105,7 @@ test_codet_selector:
 	--state_path $(create_state_data_save_path) \
 	--com lowerbound \
 	--resume $(checkpoint_path)/upperbound/no_rsu/epoch_$(n_epoch).pth \
-	--logpath $(log_path) \
+	--logpath $(results_path) \
 	--apply_late_fusion 0 \
 	--visualization $(visualization) \
 	--rsu 1 \
@@ -97,6 +114,8 @@ test_codet_selector:
 	--sel_method $(sel_method) \
 	--K $(K) \
 	--budget_mb $(budget_mb) \
+	--sel_model_path $(sel_model_path) \
+	--sel_threshold $(sel_threshold) \
 	--scene_begin $(scene_begin) \
 	--scene_end $(scene_end) \
 
@@ -114,7 +133,7 @@ test_late_fusion_rsu:
 	--state_path $(create_state_data_save_path) \
 	--com lowerbound \
 	--resume $(checkpoint_path)/lowerbound/with_rsu/epoch_$(n_epoch).pth \
-	--logpath $(log_path) \
+	--logpath $(results_path) \
 	--apply_late_fusion 1 \
 	--no_rsu_detect 1 \
 	--visualization $(visualization) \
@@ -134,7 +153,7 @@ test_rsu_only:
 	--state_path $(create_state_data_save_path) \
 	--com lowerbound \
 	--resume $(checkpoint_path)/lowerbound/with_rsu/epoch_$(n_epoch).pth \
-	--logpath $(log_path) \
+	--logpath $(results_path) \
 	--apply_late_fusion 0 \
 	--visualization $(visualization) \
 	--rsu 1 \
@@ -157,7 +176,7 @@ test:
 	--state_path $(create_state_data_save_path) \
 	--com $(com) \
 	--resume $(checkpoint_path)/$(com)/no_rsu/epoch_$(n_epoch).pth \
-	--logpath $(log_path) \
+	--logpath $(results_path) \
 	--apply_late_fusion $(apply_late_fusion) \
 	--visualization $(visualization) \
 	--rsu $(rsu) \
@@ -169,6 +188,52 @@ test:
 	--scene_begin $(scene_begin) \
 	--scene_end $(scene_end) \
 	$(if $(filter-out 0,$(max_inference_ms)),--max_inference_ms $(max_inference_ms),)
+
+
+# Train the learned agent selector with REINFORCE.
+#
+# Smoke run (2 epochs × 30 frames — confirms data loads, cache builds, reward moves):
+#   make train_selector_smoke
+#
+# Full overnight run:
+#   make train_selector
+#
+# Override any hyper:
+#   make train_selector selector_rl_epochs=30 selector_lambda_cost=0.2
+train_selector_smoke:
+	python -m selection.train_selector \
+	--ckpt       $(checkpoint_path)/upperbound/no_rsu/epoch_$(n_epoch).pth \
+	--data_det   $(create_bev_data_save_path)/train \
+	--data_val   $(create_bev_data_save_path)/test \
+	--data_state $(create_state_data_save_path) \
+	--save_dir   $(selector_save_dir)_smoke \
+	--cache_dir  $(selector_cache_dir) \
+	--train_scene_begin 0  --train_scene_end 10 \
+	--val_scene_begin   0  --val_scene_end   10 \
+	--rl_epochs 2 \
+	--curriculum_epochs 1 \
+	--lambda_cost $(selector_lambda_cost) \
+	--lr $(selector_lr) \
+	--frames_per_epoch $(selector_frames_per_epoch) \
+	--val_every 1 \
+	--tensorboard
+
+train_selector:
+	python -m selection.train_selector \
+	--ckpt       $(checkpoint_path)/upperbound/no_rsu/epoch_$(n_epoch).pth \
+	--data_det   $(create_bev_data_save_path)/train \
+	--data_val   $(create_bev_data_save_path)/test \
+	--data_state $(create_state_data_save_path) \
+	--save_dir   $(selector_save_dir) \
+	--cache_dir  $(selector_cache_dir) \
+	--train_scene_begin 0  --train_scene_end 100 \
+	--val_scene_begin   0  --val_scene_end   100 \
+	--rl_epochs $(selector_rl_epochs) \
+	--curriculum_epochs $(selector_curriculum_epochs) \
+	--lambda_cost $(selector_lambda_cost) \
+	--lr $(selector_lr) \
+	--val_every $(selector_val_every) \
+	--tensorboard
 
 
 # Fine-tune FaFNet for RSU-centric cooperative detection.
