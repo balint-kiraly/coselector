@@ -460,10 +460,16 @@ def main(args):
                 agent_id: idx for idx, agent_id in enumerate(agent_idx_range)
             }
 
-            # Extract transform table early so it's available for selection policies
-            # that need agent positions (closest_k, heuristic, bandwidth_aware).
-            # Slot [0, j] = T_{agent_j → reference_frame}.
-            _ref_table = torch.as_tensor(trans_matrices_list[0])  # (1, N, 4, 4)
+            # Extract transform table from the RSU's data (always trans_matrices_list[0]
+            # because agent_idx_range[0] = 0 when --rsu 1).
+            # Row j = T_{agent_j → RSU_frame}; translation [j, 0:2, 3] = vehicle position.
+            # IMPORTANT: this is only valid when --rsu 1 (RSU is agent_idx_range[0]).
+            if not args.rsu:
+                raise RuntimeError(
+                    "--selection requires --rsu 1: distance-based policies need "
+                    "T_{j→RSU} from agent 0's trans_matrices."
+                )
+            _ref_table = torch.as_tensor(trans_matrices_list[0])  # (1, N_agents, 4, 4)
 
             # ------------------ Agent Selection Model ------------------
             if args.selection and args.sel_method == "ml_model" and cnt == 0:

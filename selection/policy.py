@@ -56,19 +56,35 @@ def select_agents_from_metadata(
 # Returns (N, 2) float array of [x_rsu, y_rsu] for each agent.
 # ─────────────────────────────────────────────────────────────────────────────
 def _rsu_positions(state_features: torch.Tensor, rsu_trans: Optional[torch.Tensor], metas) -> np.ndarray:
+    """Return (N, 2) array of [x_rsu, y_rsu] for each agent, in RSU frame.
+
+    rsu_trans must be provided: trans_matrices_list[0] squeezed to (N_agents, 4, 4),
+    where row j = T_{agent_j → RSU_frame}.  The translation column ([*, 0:2, 3])
+    is the origin of agent j expressed in RSU coordinates = vehicle position.
+    """
     N = state_features.shape[0]
-    if rsu_trans is not None and len(metas) == N:
-        trans_np = rsu_trans.detach().cpu().numpy() if isinstance(rsu_trans, torch.Tensor) else np.asarray(rsu_trans)
-        pos = np.zeros((N, 2), dtype=np.float32)
-        for i, meta in enumerate(metas):
-            j = meta.agent_id  # column index in rsu_trans
-            if j < trans_np.shape[0]:
-                pos[i, 0] = trans_np[j, 0, 3]
-                pos[i, 1] = trans_np[j, 1, 3]
-        return pos
-    # Fallback: use x, y from state features (indices 0, 1)
-    feats = state_features.detach().cpu().numpy()
-    return feats[:, :2]
+    if rsu_trans is None:
+        raise ValueError(
+            "_rsu_positions requires rsu_trans (T_{j→RSU} table). "
+            "Ensure --rsu 1 is set and trans_matrices_list[0] is passed as rsu_trans."
+        )
+    if len(metas) != N:
+        raise ValueError(
+            f"len(metas)={len(metas)} != state_features.shape[0]={N}. "
+            "metas and state_features must be aligned."
+        )
+    trans_np = rsu_trans.detach().cpu().numpy() if isinstance(rsu_trans, torch.Tensor) else np.asarray(rsu_trans)
+    pos = np.zeros((N, 2), dtype=np.float32)
+    for i, meta in enumerate(metas):
+        j = meta.agent_id  # row index in rsu_trans: T_{agent_j → RSU}
+        if j >= trans_np.shape[0]:
+            raise IndexError(
+                f"agent_id={j} out of range for rsu_trans with shape {trans_np.shape}. "
+                "Check --num_agent matches the dataset."
+            )
+        pos[i, 0] = trans_np[j, 0, 3]   # x of agent j in RSU frame
+        pos[i, 1] = trans_np[j, 1, 3]   # y of agent j in RSU frame
+    return pos
 
 
 # ─────────────────────────────────────────────────────────────────────────────
