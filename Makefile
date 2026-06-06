@@ -1,4 +1,4 @@
-.PHONY: create_data test test_identity_rsu test_rsu_only train_rsu_centric
+.PHONY: create_data test test_identity_rsu test_rsu_only test_late_fusion_rsu train_rsu_centric
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # V2X-Sim-2 raw dataset root
@@ -99,6 +99,30 @@ test_codet_selector:
 	--budget_mb $(budget_mb) \
 	--scene_begin $(scene_begin) \
 	--scene_end $(scene_end) \
+
+
+# Late-fusion RSU baseline.
+# Vehicles 1-5 each detect independently in their own frame. Box predictions are
+# transformed into RSU frame and NMS-fused. RSU's own lidar is suppressed
+# (--no_rsu_detect 1) so it acts as a passive relay — consistent with selection tests.
+# Evaluated against RSU GT (agent 0).  No BEV sharing — only final boxes are sent.
+# Checkpoint: lowerbound/with_rsu (needed to match num_agent=6 architecture;
+# RSU lidar contribution is zeroed out before fusion by --no_rsu_detect).
+test_late_fusion_rsu:
+	python test_codet_selector.py \
+	--data_prep $(testing_data) \
+	--state_path $(create_state_data_save_path) \
+	--com lowerbound \
+	--resume $(checkpoint_path)/lowerbound/with_rsu/epoch_$(n_epoch).pth \
+	--logpath $(log_path) \
+	--apply_late_fusion 1 \
+	--no_rsu_detect 1 \
+	--visualization $(visualization) \
+	--rsu 1 \
+	--num_agent 6 \
+	--eval_start_idx 0 \
+	--scene_begin $(scene_begin) \
+	--scene_end $(scene_end)
 
 
 # RSU lidar-only baseline.

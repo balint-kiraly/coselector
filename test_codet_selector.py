@@ -344,9 +344,12 @@ def main(args):
     tracking_file = [set()] * num_agent
 
     sel_model = None
-    # When rsu=1 and num_agent=1, the only loaded agent IS the RSU itself —
-    # start evaluation from index 0 instead of skipping it.
-    eval_start_idx = 0 if (args.rsu and num_agent == 1) else (1 if args.rsu else 0)
+    if args.eval_start_idx >= 0:
+        eval_start_idx = args.eval_start_idx          # explicit override
+    elif args.rsu and num_agent == 1:
+        eval_start_idx = 0                            # RSU-only: evaluate the RSU itself
+    else:
+        eval_start_idx = 1 if args.rsu else 0         # default: skip RSU slot in multi-agent mode
     frames_processed = 0
     measurements_dir = args.measurements_dir if args.measurements_dir else None
     try:
@@ -731,8 +734,12 @@ def main(args):
         if args.selection:
             eval_start_idx = 0
             num_agent = 1
+        elif args.eval_start_idx >= 0:
+            eval_start_idx = args.eval_start_idx
+        elif args.rsu and num_agent == 1:
+            eval_start_idx = 0
         else:
-            eval_start_idx = 0 if (args.rsu and num_agent == 1) else (1 if args.rsu else 0)
+            eval_start_idx = 1 if args.rsu else 0
 
         # local qualitative evaluation
         for k in range(eval_start_idx, num_agent):
@@ -763,6 +770,13 @@ def main(args):
 
             # late fusion
             if run_late_fusion and len(result[k]) != 0:
+                # When the RSU is a passive relay (no_rsu_detect), suppress its
+                # own lidar predictions before fusing so only vehicle boxes
+                # contribute.  pred_restore/score_restore already saved above.
+                if args.no_rsu_detect and k == 0:
+                    result[k][0][0][0]["pred"] = np.empty((0, 1, 4, 2))
+                    result[k][0][0][0]["score"] = np.array([])
+                    result[k][0][0][0]["selected_idx"] = np.array([])
                 box_colors = late_fusion(
                     k, num_agent, result, trans_matrices, box_color_map
                 )
@@ -1271,6 +1285,27 @@ if __name__ == "__main__":
         default=0,
         type=int,
         help="1: only v2i, 0: v2v and v2i",
+    )
+    parser.add_argument(
+        "--no_rsu_detect",
+        default=0,
+        type=int,
+        help=(
+            "1: suppress RSU lidar predictions before late fusion so only vehicle "
+            "boxes contribute (RSU acts as passive relay). "
+            "Requires --apply_late_fusion 1 --eval_start_idx 0 --rsu 1."
+        ),
+    )
+    parser.add_argument(
+        "--eval_start_idx",
+        default=-1,
+        type=int,
+        help=(
+            "Override the agent index at which evaluation starts. "
+            "-1 (default) = auto: 0 when rsu+num_agent==1 (RSU-only), "
+            "1 when rsu>0 (skip RSU slot), 0 otherwise. "
+            "Set to 0 to evaluate from RSU frame (e.g. late-fusion RSU baseline)."
+        ),
     )
     parser.add_argument(
         "--scene_begin",
