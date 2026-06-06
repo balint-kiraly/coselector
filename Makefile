@@ -102,12 +102,12 @@ test_codet_selector:
 
 
 # Late-fusion RSU baseline.
-# Vehicles 1-5 each detect independently in their own frame. Box predictions are
-# transformed into RSU frame and NMS-fused. RSU's own lidar is suppressed
-# (--no_rsu_detect 1) so it acts as a passive relay — consistent with selection tests.
-# Evaluated against RSU GT (agent 0).  No BEV sharing — only final boxes are sent.
-# Checkpoint: lowerbound/with_rsu (needed to match num_agent=6 architecture;
-# RSU lidar contribution is zeroed out before fusion by --no_rsu_detect).
+# Vehicles 1-5 each detect independently on their own BEV in their own frame.
+# Box predictions are transformed into RSU frame and NMS-fused at the RSU.
+# RSU's own lidar is suppressed (--no_rsu_detect 1): it is a passive relay only.
+# Only the RSU's merged detection result is evaluated against RSU GT (agent 0 AOI).
+# eval_start_idx and eval loop bound are set automatically in code for this mode.
+# Checkpoint: lowerbound/with_rsu (matches num_agent=6 model architecture).
 test_late_fusion_rsu:
 	python test_codet_selector.py \
 	--data_prep $(testing_data) \
@@ -120,7 +120,6 @@ test_late_fusion_rsu:
 	--visualization $(visualization) \
 	--rsu 1 \
 	--num_agent 6 \
-	--eval_start_idx 0 \
 	--scene_begin $(scene_begin) \
 	--scene_end $(scene_end)
 

@@ -1,20 +1,27 @@
 """Three-axis communication cost model for cloud-based V2X cooperative perception.
 
-Architecture assumed
---------------------
-Vehicles transmit **raw LiDAR** (.pcd.bin, ~0.5 MB each) to a cloud server.
-The server voxelizes each selected agent's upload into a BEV tensor (precomputation),
-fuses them, runs detection model, and returns detection boxes.
+Two operating modes
+-------------------
+**BEV-upload mode** (default, ``late_fusion=False``)
+    Vehicles transmit raw LiDAR (.pcd.bin, ~0.5 MB each) to a cloud server.
+    The server voxelizes each upload into a BEV tensor (precomputation), fuses
+    them, runs one joint detection, and returns boxes.
+
+**Late-fusion mode** (``late_fusion=True``)
+    Each vehicle runs voxelization and detection locally (on-board).
+    Only compact bounding-box results (~4 KB each) are sent to the RSU.
+    The RSU transforms boxes into its frame and runs NMS — no LiDAR is uploaded.
 
 Three cost axes
 ---------------
-1. Bandwidth   bandwidth_MB = N_selected × lidar_size_MB
-2. Latency     total_latency_ms = upload_ms + precomp_ms + inference_ms
-               - upload_ms   = lidar_size_bytes × 8 / link_rate_bps × 1000
-                              (one-time upload, N agents transmit in parallel)
-               - precomp_ms  = N_selected × precomp_per_agent_ms
-               - inference_ms is measured per frame and passed in at call time
-3. Energy      total_energy_J = N_selected × precomp_energy_J + inference_energy_J
+                        BEV-upload                    Late-fusion
+1. Bandwidth   N × lidar_size_MB              N × detection_size_MB
+2. Latency     lidar_upload + N×precomp        precomp + inference/agent
+               + inference                     + det_upload
+               (upload dominates)              (all parallel → one agent's time)
+3. Energy      N × precomp_J + inference_J     N × precomp_J + inference_J
+               (centralised server)            (distributed across vehicles;
+                                                total is identical)
 
 Combined cost (normalised)
 --------------------------
@@ -47,6 +54,11 @@ from enum import Enum
 #: Mean raw LiDAR file size across V2X-Sim scenes, agents 0-5.
 #: Source: tools/measure_lidar_size.py
 MEASURED_LIDAR_SIZE_MB: float = 0.4934
+
+#: Estimated bounding-box payload per agent in late-fusion mode.
+#: A V2X-Sim detection is 4 corners × 2 coords × float32 = 32 B/box,
+#: plus 4 B score and 4 B index ≈ 40 B/box.  With ~100 boxes/agent: ~4 KB.
+ESTIMATED_DETECTION_SIZE_MB: float = 0.004
 
 #: Mean per-agent voxelization time (CPU, server-side).
 #: Source: tools/measure_precomp_cost.py
@@ -87,10 +99,16 @@ class CostConfig:
     returned as 0 so a partially-configured model degrades gracefully.
     """
 
+    # ── Operating mode ───────────────────────────────────────────────────────
+    # late_fusion=True:  vehicles detect on-board, send only boxes to RSU.
+    # late_fusion=False: vehicles send raw LiDAR to cloud server (default).
+    late_fusion: bool = False
+
     # ── Measured constants (fill from measurement tools) ────────────────────
     lidar_size_MB: float = MEASURED_LIDAR_SIZE_MB
     precomp_per_agent_ms: float = MEASURED_PRECOMP_PER_AGENT_MS
     precomp_energy_J: float = MEASURED_PRECOMP_ENERGY_J
+    detection_size_MB: float = ESTIMATED_DETECTION_SIZE_MB  # late-fusion only
 
     # ── Configurable link parameters ─────────────────────────────────────────
     link_rate_Mbps: float = 10.0   # C-V2X Uu uplink, urban typical
@@ -225,14 +243,26 @@ class CostConfig:
     def _compute_norms(self) -> None:
         """Internal: recompute max_* from stored inference_norm values."""
         N = self.n_max_agents
-        upload_ms = self._upload_ms_one_agent()
-        self.max_bandwidth_MB = N * self.lidar_size_MB
-        self.max_latency_ms = (
-            upload_ms
-            + N * self.precomp_per_agent_ms
-            + self.inference_norm_ms
-        )
-        self.max_energy_J = N * self.precomp_energy_J + self.inference_norm_energy_J
+        if self.late_fusion:
+            # Worst case: all N agents, each running precomp + inference independently.
+            # inference_norm_ms / inference_norm_energy_J are from the batched identity
+            # run (all N agents together); divide by N to get per-agent values, then
+            # multiply back: N × per_agent = batch total for latency/energy denominators.
+            per_agent_inf_ms = self.inference_norm_ms / max(N, 1)
+            per_agent_inf_energy = self.inference_norm_energy_J / max(N, 1)
+            det_upload_ms = self._upload_ms_detections()
+            self.max_bandwidth_MB = N * self.detection_size_MB
+            self.max_latency_ms = self.precomp_per_agent_ms + per_agent_inf_ms + det_upload_ms
+            self.max_energy_J = N * self.precomp_energy_J + N * per_agent_inf_energy
+        else:
+            upload_ms = self._upload_ms_one_agent()
+            self.max_bandwidth_MB = N * self.lidar_size_MB
+            self.max_latency_ms = (
+                upload_ms
+                + N * self.precomp_per_agent_ms
+                + self.inference_norm_ms
+            )
+            self.max_energy_J = N * self.precomp_energy_J + self.inference_norm_energy_J
 
     @property
     def norms_calibrated(self) -> bool:
@@ -242,6 +272,12 @@ class CostConfig:
     def _upload_ms_one_agent(self) -> float:
         """Upload time for a single agent's raw LiDAR over the configured link."""
         bits = self.lidar_size_MB * 1e6 * 8
+        link_bps = self.link_rate_Mbps * 1e6
+        return bits / link_bps * 1000.0  # ms
+
+    def _upload_ms_detections(self) -> float:
+        """Upload time for one agent's detection boxes over the configured link."""
+        bits = self.detection_size_MB * 1e6 * 8
         link_bps = self.link_rate_Mbps * 1e6
         return bits / link_bps * 1000.0  # ms
 
@@ -310,18 +346,40 @@ def compute_cost(
     if inference_ms < 0:
         raise ValueError("inference_ms must be >= 0")
 
-    # ── 1. Bandwidth ─────────────────────────────────────────────────────────
-    bandwidth_MB = n_selected * config.lidar_size_MB
+    if config.late_fusion:
+        # ── Late-fusion mode ─────────────────────────────────────────────────
+        # Vehicles detect on-board in parallel; only boxes reach the RSU.
 
-    # ── 2. Latency ───────────────────────────────────────────────────────────
-    # Upload is parallel across agents; cost = one agent's upload time.
-    upload_ms = config._upload_ms_one_agent() if n_selected > 0 else 0.0
-    precomp_ms = n_selected * config.precomp_per_agent_ms
-    latency_total_ms = upload_ms + precomp_ms + inference_ms
+        # 1. Bandwidth: box payload only (no raw LiDAR transmitted)
+        bandwidth_MB = n_selected * config.detection_size_MB
 
-    # ── 3. Energy ────────────────────────────────────────────────────────────
-    total_precomp_energy_J = n_selected * config.precomp_energy_J
-    total_energy_J = total_precomp_energy_J + inference_energy_J
+        # 2. Latency: all agents work in parallel → one agent's critical path.
+        #    inference_ms is measured for the whole batch; divide to get per-agent.
+        per_agent_inf_ms = inference_ms / max(n_selected, 1) if n_selected > 0 else 0.0
+        precomp_ms  = config.precomp_per_agent_ms if n_selected > 0 else 0.0
+        upload_ms   = config._upload_ms_detections() if n_selected > 0 else 0.0
+        latency_total_ms = precomp_ms + per_agent_inf_ms + upload_ms
+
+        # 3. Energy: N × precomp_J + N × inference_J_per_agent.
+        #    inference_energy_J is the per-agent value (caller divides the measured
+        #    batch total by n_selected before passing in late-fusion mode).
+        total_precomp_energy_J = n_selected * config.precomp_energy_J
+        total_energy_J = total_precomp_energy_J + n_selected * inference_energy_J
+
+    else:
+        # ── BEV-upload mode (default) ────────────────────────────────────────
+
+        # 1. Bandwidth: full LiDAR payload per agent
+        bandwidth_MB = n_selected * config.lidar_size_MB
+
+        # 2. Latency: upload parallel, precomp sequential on server, then inference
+        upload_ms = config._upload_ms_one_agent() if n_selected > 0 else 0.0
+        precomp_ms = n_selected * config.precomp_per_agent_ms
+        latency_total_ms = upload_ms + precomp_ms + inference_ms
+
+        # 3. Energy: server-side precomp + inference
+        total_precomp_energy_J = n_selected * config.precomp_energy_J
+        total_energy_J = total_precomp_energy_J + inference_energy_J
 
     # ── Combined (normalised) ────────────────────────────────────────────────
     def _norm(val: float, max_val: float) -> float:
@@ -336,6 +394,12 @@ def compute_cost(
     weight_sum = config.alpha_bw + config.alpha_lat + config.alpha_energy
     combined_cost = (bw_term + lat_term + energy_term) / max(weight_sum, 1e-9)
 
+    # inference_energy_J stored in the result is always the TOTAL inference
+    # energy contribution (N × per_agent for late fusion, 1 × batch for BEV).
+    total_inference_energy_J = (
+        n_selected * inference_energy_J if config.late_fusion else inference_energy_J
+    )
+
     return CommunicationCost(
         n_selected=n_selected,
         bandwidth_MB=bandwidth_MB,
@@ -344,7 +408,7 @@ def compute_cost(
         inference_ms=inference_ms,
         latency_total_ms=latency_total_ms,
         precomp_energy_J=total_precomp_energy_J,
-        inference_energy_J=inference_energy_J,
+        inference_energy_J=total_inference_energy_J,
         total_energy_J=total_energy_J,
         combined_cost=combined_cost,
     )

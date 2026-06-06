@@ -383,6 +383,15 @@ def main(args):
                 return json.load(_f)
         return {}
 
+    # Late-fusion mode: vehicles detect on-board, send only boxes to RSU.
+    # apply_late_fusion=1 without --selection means we're running the late-fusion
+    # lowerbound baseline.  Switch the cost model so bandwidth reflects box payload
+    # and latency reflects one parallel precomp+inference+box-upload chain.
+    is_late_fusion = (apply_late_fusion == 1 and not args.selection)
+    cost_config.late_fusion = is_late_fusion
+    if is_late_fusion:
+        print("Cost model: late-fusion mode (box payload only, parallel per-agent latency)")
+
     if args.max_inference_ms and args.max_inference_ms > 0:
         cost_config.compute_normalization_constants(
             ref_inference_ms=args.max_inference_ms,
@@ -399,6 +408,9 @@ def main(args):
             )
             print(f"Cost norms from inference_norms.json: {norm_key} → {_entry['avg_inference_ms']:.1f} ms")
         elif cost_config.norms_calibrated:
+            # late_fusion flag was set after from_measurements_dir already ran _compute_norms,
+            # so recompute with the correct mode now.
+            cost_config._compute_norms()
             print(f"Cost norms from measurements: inference_norm_ms={cost_config.inference_norm_ms:.1f} ms")
         else:
             print(
@@ -740,15 +752,37 @@ def main(args):
         if args.selection:
             eval_start_idx = 0
             num_agent = 1
+            # late_fusion_n_agents: how many result slots late_fusion() should scan.
+            # For selection mode there is only 1 agent, so 1.
+            late_fusion_n_agents = 1
+        elif is_late_fusion and args.rsu:
+            # Late fusion at RSU: FaFNet predicted on all N agents' individual BEVs.
+            # late_fusion() merges agents 1..N-1 boxes into agent 0 (RSU frame).
+            # We then evaluate only agent 0 against RSU GT.
+            # IMPORTANT: num_agent must stay at its original value so late_fusion()
+            # can scan all result slots when merging.  eval_start/end control the
+            # evaluation loop independently.
+            eval_start_idx = 0
+            eval_end_idx = 1          # only evaluate RSU (k=0)
+            late_fusion_n_agents = num_agent   # full count for the merge
         elif args.eval_start_idx >= 0:
             eval_start_idx = args.eval_start_idx
+            eval_end_idx = num_agent
+            late_fusion_n_agents = num_agent
         elif args.rsu and num_agent == 1:
             eval_start_idx = 0
+            eval_end_idx = num_agent
+            late_fusion_n_agents = num_agent
         else:
             eval_start_idx = 1 if args.rsu else 0
+            eval_end_idx = num_agent
+            late_fusion_n_agents = num_agent
+
+        if args.selection:
+            eval_end_idx = num_agent   # num_agent already set to 1 above
 
         # local qualitative evaluation
-        for k in range(eval_start_idx, num_agent):
+        for k in range(eval_start_idx, eval_end_idx):
             box_colors = None
             # Late fusion is not applicable in selection mode: BEVs have already
             # been fused at the data level before the detector runs.
@@ -763,9 +797,10 @@ def main(args):
                 "reg_targets": torch.unsqueeze(reg_target[k, :, :, :, :, :], 0),
                 "anchors": torch.unsqueeze(anchors_map[k, :, :, :, :], 0),
             }
-            # RSU-centric: evaluate against RSU GT boxes, not the selected vehicle's GT.
-            if args.rsu and args.selection:
-                temp = rsu_gt_max_iou
+            # Use RSU GT when: (a) selection mode with RSU, (b) late-fusion at RSU.
+            # In both cases all vehicle detections are evaluated in the RSU's AOI.
+            if (args.rsu and args.selection) or (is_late_fusion and args.rsu and k == 0):
+                temp = gt_max_iou[0]   # RSU GT (index 0 in the loaded data)
             else:
                 temp = gt_max_iou[k]
 
@@ -784,7 +819,7 @@ def main(args):
                     result[k][0][0][0]["score"] = np.array([])
                     result[k][0][0][0]["selected_idx"] = np.array([])
                 box_colors = late_fusion(
-                    k, num_agent, result, trans_matrices, box_color_map
+                    k, late_fusion_n_agents, result, trans_matrices, box_color_map
                 )
 
             result_temp = result[k]
@@ -899,9 +934,15 @@ def main(args):
     total_inf_ms = sum(r["inference_ms"] for r in frame_cost_rows) or 1.0
     for r in frame_cost_rows:
         share = r["inference_ms"] / total_inf_ms
-        inf_energy = total_run_energy_J * share
-        # recompute the energy + combined cost with the distributed value
-        cc = compute_cost(r["n_selected"], r["inference_ms"], inf_energy, cost_config)
+        inf_energy_batch = total_run_energy_J * share   # total for all agents in this frame
+        # Late fusion: each vehicle runs inference independently.
+        # compute_cost expects per-agent inference energy so it can compute N × inference_J.
+        # BEV-upload: one centralized inference — pass the batch total directly.
+        if is_late_fusion:
+            inf_energy_for_cost = inf_energy_batch / max(r["n_selected"], 1)
+        else:
+            inf_energy_for_cost = inf_energy_batch
+        cc = compute_cost(r["n_selected"], r["inference_ms"], inf_energy_for_cost, cost_config)
         r["inference_energy_J"] = cc.inference_energy_J
         r["total_energy_J"] = cc.total_energy_J
         r["combined_cost"] = cc.combined_cost
@@ -1183,6 +1224,8 @@ def main(args):
         "max_inference_ms": args.max_inference_ms,
         "cost_norms_calibrated": cost_config.norms_calibrated,
         "norm_key": norm_key,
+        "late_fusion": is_late_fusion,
+        "detection_size_MB": cost_config.detection_size_MB,
     }
     with open(os.path.join(run_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
