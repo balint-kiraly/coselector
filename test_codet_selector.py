@@ -1041,7 +1041,11 @@ def main(args):
         )
     )
 
-    for k in range(0 if args.selection else (num_agent - 1 if args.rsu else num_agent)):
+    # mean_ap_local has 2 entries per evaluated agent plus 2 for the overall average.
+    # Derive the count from the list length rather than num_agent so late-fusion RSU
+    # mode (1 agent evaluated) and standard multi-agent mode both work correctly.
+    n_evaluated_agents = (len(mean_ap_local) - 2) // 2
+    for k in range(n_evaluated_agents):
         print_and_write_log(
             "agent{} mAP@0.5 is {} and mAP@0.7 is {}".format(
                 k + 1, mean_ap_local[k * 2], mean_ap_local[(k * 2) + 1]
