@@ -15,6 +15,7 @@ Usage example:
 
 import argparse
 import csv
+import gc
 import os
 import sys
 import time
@@ -332,6 +333,8 @@ def run_train_epoch(
     ema_var: float,
     lambda_cost: float,
     frames_per_epoch: int = 0,
+    tb_writer=None,
+    global_step: int = 0,
 ):
     selector.train()
     fafmodule.model.eval()
@@ -346,8 +349,9 @@ def run_train_epoch(
     total_n_sel = 0.0
     n_frames = 0
 
-    bar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
-    for batch in bar:
+    tqdm_total = frames_per_epoch if frames_per_epoch > 0 else len(loader)
+    bar = tqdm(total=tqdm_total, desc=f"Epoch {epoch}", leave=False)
+    for batch in loader:
         if frames_per_epoch > 0 and n_frames >= frames_per_epoch:
             break
 
@@ -449,7 +453,7 @@ def run_train_epoch(
             probs * torch.log(probs + 1e-8)
             + (1 - probs) * torch.log(1 - probs + 1e-8)
         ).sum()
-        loss = -(log_probs.sum() * advantage) - 0.05 * entropy
+        loss = -(log_probs.sum() * advantage) - 0.3 * entropy
 
         optimizer.zero_grad()
         loss.backward()
@@ -463,6 +467,19 @@ def run_train_epoch(
         total_cost_norm += cost_norm
         total_n_sel += len(selected_dataset_indices)
         n_frames += 1
+        global_step += 1
+        bar.update(1)
+
+        # ── Per-step TensorBoard (negligible overhead vs detector forward) ────
+        if tb_writer is not None:
+            tb_writer.add_scalar("step/reward",      reward,                      global_step)
+            tb_writer.add_scalar("step/q_norm",      q_norm,                      global_step)
+            tb_writer.add_scalar("step/cost_norm",   cost_norm,                   global_step)
+            tb_writer.add_scalar("step/loss",        loss.item(),                 global_step)
+            tb_writer.add_scalar("step/entropy",     entropy.item(),              global_step)
+            tb_writer.add_scalar("step/n_selected",  len(selected_dataset_indices), global_step)
+            tb_writer.add_scalar("step/advantage",   advantage,                   global_step)
+            tb_writer.add_scalar("step/ema_mean",    ema_mean,                    global_step)
 
         bar.set_postfix(
             R=f"{reward:.2f}",
@@ -473,8 +490,10 @@ def run_train_epoch(
             n_bar=f"{len(selected_dataset_indices)}",
         )
 
+    bar.close()
+
     if n_frames == 0:
-        return ema_mean, ema_var, {}
+        return ema_mean, ema_var, {}, global_step
 
     metrics = {
         "avg_loss": total_loss / n_frames,
@@ -484,7 +503,7 @@ def run_train_epoch(
         "avg_cost_norm": total_cost_norm / n_frames,
         "avg_n_selected": total_n_sel / n_frames,
     }
-    return ema_mean, ema_var, metrics
+    return ema_mean, ema_var, metrics, global_step
 
 
 # ── Validation (Task 6) ───────────────────────────────────────────────────────
@@ -769,11 +788,13 @@ def main():
     ema_mean = 0.0
     ema_var = 1.0
     best_val_map = 0.0
+    global_step = 0
 
     if os.path.isfile(last_ckpt):
         start_epoch, ema_mean, ema_var, best_val_map = _load_checkpoint(
             last_ckpt, selector, optimizer
         )
+        global_step = start_epoch * args.frames_per_epoch  # approximate resume offset
         print(f"Resumed from epoch {start_epoch - 1} (best_val_map={best_val_map:.4f})")
 
     # ── CSV metrics file ──────────────────────────────────────────────────────
@@ -798,11 +819,21 @@ def main():
     # ── Training loop ─────────────────────────────────────────────────────────
     try:
         for epoch in range(start_epoch, args.rl_epochs):
+            # Free GPU memory fragmentation and DataLoader worker leaks from the
+            # previous epoch's mid-loop break.  Recreating the loader each epoch
+            # ensures workers are cleanly restarted rather than left dangling.
+            gc.collect()
+            torch.cuda.empty_cache()
+            train_loader = DataLoader(
+                train_dataset, batch_size=1, shuffle=True,
+                num_workers=args.num_workers,
+            )
+
             lambda_cost = 0.0 if epoch < args.curriculum_epochs else args.lambda_cost
             phase = "curriculum" if epoch < args.curriculum_epochs else "full"
             print(f"\nEpoch {epoch}/{args.rl_epochs - 1}  λ_cost={lambda_cost}  [{phase}]")
 
-            ema_mean, ema_var, metrics = run_train_epoch(
+            ema_mean, ema_var, metrics, global_step = run_train_epoch(
                 epoch=epoch,
                 selector=selector,
                 optimizer=optimizer,
@@ -816,6 +847,8 @@ def main():
                 ema_var=ema_var,
                 lambda_cost=lambda_cost,
                 frames_per_epoch=args.frames_per_epoch,
+                tb_writer=tb_writer,
+                global_step=global_step,
             )
 
             # Periodic validation

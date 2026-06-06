@@ -1,5 +1,5 @@
 .PHONY: create_data test test_identity_rsu test_rsu_only test_late_fusion_rsu train_rsu_centric \
-        train_selector train_selector_smoke
+        train_selector train_selector_smoke clean_selector
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # V2X-Sim-2 raw dataset root
@@ -49,12 +49,13 @@ train_patience := 7
 
 # ── Selector training parameters ──────────────────────────────────────────────
 selector_save_dir          := $(results_path)/selector
-selector_rl_epochs         := 20
-selector_curriculum_epochs := 3
+selector_rl_epochs         := 10
+selector_curriculum_epochs := 0
 selector_lambda_cost       := 0.4
 selector_lr                := 1e-3
-selector_val_every         := 3
-selector_frames_per_epoch  := 30   # smoke test only
+selector_val_every         := 2
+selector_frames_per_epoch  := 30    # smoke test only
+selector_frames_per_epoch_full := 2000  # full run: ~17 min/epoch × 10 = ~3 h
 # Directory for pre-training frame caches (q_lower/q_upper/features).
 # The script names each file selector_cache_s{begin}-{end}.pt automatically.
 # Delete the relevant file to force a rebuild (e.g. after swapping the detector ckpt).
@@ -211,7 +212,7 @@ train_selector_smoke:
 	--train_scene_begin 0  --train_scene_end 10 \
 	--val_scene_begin   0  --val_scene_end   10 \
 	--rl_epochs 2 \
-	--curriculum_epochs 1 \
+	--curriculum_epochs 0 \
 	--lambda_cost $(selector_lambda_cost) \
 	--lr $(selector_lr) \
 	--frames_per_epoch $(selector_frames_per_epoch) \
@@ -232,8 +233,28 @@ train_selector:
 	--curriculum_epochs $(selector_curriculum_epochs) \
 	--lambda_cost $(selector_lambda_cost) \
 	--lr $(selector_lr) \
+	--frames_per_epoch $(selector_frames_per_epoch_full) \
 	--val_every $(selector_val_every) \
 	--tensorboard
+
+
+# Remove selector training artifacts for a clean restart.
+# Deletes checkpoints, metrics CSV, and TensorBoard events from both the
+# full and smoke save directories.  The frame cache (selector_cache.pt) is
+# intentionally preserved — it takes ~1 h to build and is reusable.
+#
+# Usage:
+#   make clean_selector          # wipe full-run artifacts
+#   make clean_selector smoke=1  # also wipe smoke-run artifacts
+clean_selector:
+	rm -fv $(selector_save_dir)/selector_last.pth \
+	       $(selector_save_dir)/selector_best.pth \
+	       $(selector_save_dir)/train_metrics.csv \
+	       $(selector_save_dir)/events.out.tfevents.*
+	$(if $(smoke),rm -fv $(selector_save_dir)_smoke/selector_last.pth \
+	                     $(selector_save_dir)_smoke/selector_best.pth \
+	                     $(selector_save_dir)_smoke/train_metrics.csv \
+	                     $(selector_save_dir)_smoke/events.out.tfevents.*,)
 
 
 # Fine-tune FaFNet for RSU-centric cooperative detection.
