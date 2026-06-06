@@ -344,7 +344,9 @@ def main(args):
     tracking_file = [set()] * num_agent
 
     sel_model = None
-    eval_start_idx = 1 if args.rsu else 0
+    # When rsu=1 and num_agent=1, the only loaded agent IS the RSU itself —
+    # start evaluation from index 0 instead of skipping it.
+    eval_start_idx = 0 if (args.rsu and num_agent == 1) else (1 if args.rsu else 0)
     frames_processed = 0
     measurements_dir = args.measurements_dir if args.measurements_dir else None
     try:
@@ -730,7 +732,7 @@ def main(args):
             eval_start_idx = 0
             num_agent = 1
         else:
-            eval_start_idx = 1 if args.rsu else 0
+            eval_start_idx = 0 if (args.rsu and num_agent == 1) else (1 if args.rsu else 0)
 
         # local qualitative evaluation
         for k in range(eval_start_idx, num_agent):
@@ -978,7 +980,7 @@ def main(args):
         )
     )
 
-    for k in range(num_agent - 1 if args.rsu else num_agent):
+    for k in range(0 if args.selection else (num_agent - 1 if args.rsu else num_agent)):
         print_and_write_log(
             "agent{} mAP@0.5 is {} and mAP@0.7 is {}".format(
                 k + 1, mean_ap_local[k * 2], mean_ap_local[(k * 2) + 1]

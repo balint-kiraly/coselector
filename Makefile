@@ -1,4 +1,4 @@
-.PHONY: create_data test test_identity_rsu train_rsu_centric
+.PHONY: create_data test test_identity_rsu test_rsu_only train_rsu_centric
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # V2X-Sim-2 raw dataset root
@@ -99,6 +99,25 @@ test_codet_selector:
 	--budget_mb $(budget_mb) \
 	--scene_begin $(scene_begin) \
 	--scene_end $(scene_end) \
+
+
+# RSU lidar-only baseline.
+# The RSU detects using only its own point cloud — no vehicle data received.
+# num_agent=1 with rsu=1 loads only agent0 and evaluates it directly (no vehicle skip).
+# Checkpoint: lowerbound/with_rsu (trained on individual-agent BEVs, RSU included).
+test_rsu_only:
+	python test_codet_selector.py \
+	--data_prep $(testing_data) \
+	--state_path $(create_state_data_save_path) \
+	--com lowerbound \
+	--resume $(checkpoint_path)/lowerbound/with_rsu/epoch_$(n_epoch).pth \
+	--logpath $(log_path) \
+	--apply_late_fusion 0 \
+	--visualization $(visualization) \
+	--rsu 1 \
+	--num_agent 1 \
+	--scene_begin $(scene_begin) \
+	--scene_end $(scene_end)
 
 
 # General test target (non-RSU / vehicle-ego mode, original coperception style).
