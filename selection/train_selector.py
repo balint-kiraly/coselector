@@ -453,7 +453,7 @@ def run_train_epoch(
             probs * torch.log(probs + 1e-8)
             + (1 - probs) * torch.log(1 - probs + 1e-8)
         ).sum()
-        loss = -(log_probs.sum() * advantage) - 0.3 * entropy
+        loss = -(log_probs.sum() * advantage) - 0.1 * entropy
 
         optimizer.zero_grad()
         loss.backward()
