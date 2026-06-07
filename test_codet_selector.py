@@ -344,6 +344,18 @@ def main(args):
     tracking_file = [set()] * num_agent
 
     sel_model = None
+    if args.selection and args.sel_method == "ml_model":
+        assert args.sel_model_path is not None, \
+            "--sel_model_path is required for sel_method=ml_model"
+        sel_model = AgentSelectorMLP(input_dim=12).to(device)
+        ckpt_data = torch.load(args.sel_model_path, map_location=device)
+        if "model" in ckpt_data:
+            sel_model.load_state_dict(ckpt_data["model"])
+        else:
+            sel_model.load_state_dict(ckpt_data)
+        sel_model.eval()
+        print(f"Loaded agent selection model from {args.sel_model_path}")
+
     if args.eval_start_idx >= 0:
         eval_start_idx = args.eval_start_idx          # explicit override
     elif args.rsu and num_agent == 1:
@@ -483,28 +495,14 @@ def main(args):
                 )
             _ref_table = torch.as_tensor(trans_matrices_list[0])  # (1, N_agents, 4, 4)
 
-            # ------------------ Agent Selection Model ------------------
-            if args.selection and args.sel_method == "ml_model" and cnt == 0:
-                # state_feats is (N, 26): raw [0:14] + engineered [14:26].
-                # The MLP is trained on the 12 engineered columns; select_ml_model
-                # slices state_feats[:, 14:] internally.
-                sel_model = AgentSelectorMLP(input_dim=12)
-                sel_model = sel_model.to(device)
-                assert args.sel_model_path is not None, "Path to trained agent selection model is not provided"
-                ckpt_data = torch.load(args.sel_model_path, map_location=device)
-                # Support both plain state_dict and full training checkpoint
-                if "model" in ckpt_data:
-                    sel_model.load_state_dict(ckpt_data["model"])
-                else:
-                    sel_model.load_state_dict(ckpt_data)
-                sel_model.eval()
-                print(f"Loaded agent selection model from {args.sel_model_path}")
+            # sel_model is loaded once before the loop (see above).
 
             selected_state_indices = select_agents_from_metadata(
                 state_feats,
                 method=SelectionMethod(args.sel_method),
                 model=sel_model,
                 K=args.K,
+                threshold=args.sel_threshold,
                 budget_bytes=int(args.budget_mb * 1024 * 1024),
                 rsu_trans=_ref_table[0],   # (N_agents, 4, 4)
                 metas=metas,
@@ -799,8 +797,11 @@ def main(args):
             }
             # Use RSU GT when: (a) selection mode with RSU, (b) late-fusion at RSU.
             # In both cases all vehicle detections are evaluated in the RSU's AOI.
+            # IMPORTANT: gt_max_iou has already been filtered by _sel() so index 0
+            # is the first *selected vehicle*, not the RSU.  Use rsu_gt_max_iou
+            # which was saved before _sel() was applied.
             if (args.rsu and args.selection) or (is_late_fusion and args.rsu and k == 0):
-                temp = gt_max_iou[0]   # RSU GT (index 0 in the loaded data)
+                temp = rsu_gt_max_iou  # RSU GT saved before _sel() filtered the list
             else:
                 temp = gt_max_iou[k]
 
@@ -1400,6 +1401,13 @@ if __name__ == "__main__":
         default=None,
         type=str,
         help="Path to the trained agent selection model",
+    )
+    parser.add_argument(
+        "--sel_threshold",
+        default=0.5,
+        type=float,
+        help="Sigmoid threshold for ml_model selection (default 0.5). "
+             "Sweep 0.3/0.5/0.7 to trace the quality/cost Pareto curve.",
     )
     parser.add_argument(
         "--csv_path",

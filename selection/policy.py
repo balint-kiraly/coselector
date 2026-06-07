@@ -220,6 +220,7 @@ def _select_ml(
 ) -> List[int]:
     """Deterministic greedy selection: sigmoid(logits) > threshold."""
     probs = torch.sigmoid(model(features)).squeeze(-1)   # (N,)
+    print(probs)
     sel = (probs > threshold).nonzero(as_tuple=True)[0].tolist()
     if len(sel) < min_agents:
         sel = [int(probs.argmax())]
@@ -242,10 +243,14 @@ def select_ml_model(
     (default 0.5).  Sweeping 0.3 / 0.5 / 0.7 produces multiple Pareto points
     from a single trained model without re-running training.
 
-    Falls back to identity (all agents) when ``model`` is None.
+    ``model`` must be a loaded AgentSelectorMLP — passing None raises an error
+    rather than silently falling back to identity.
     """
     if model is None:
-        return list(range(state_features.shape[0]))
+        raise ValueError(
+            "select_ml_model requires a loaded model. "
+            "Pass --sel_model_path when using sel_method=ml_model."
+        )
     from data_utils.build_state_features import ML_START
     ml_feats = state_features[:, ML_START:]   # (N, 12) engineered columns
     return _select_ml(ml_feats, model, threshold=threshold)
