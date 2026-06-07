@@ -671,6 +671,12 @@ def main(args):
             n_for_cost = len(agent_idx_range)
             n_available = n_for_cost
 
+            # Save RSU GT before any filtering — used by the late-fusion eval branch.
+            if args.rsu:
+                rsu_gt_max_iou = gt_max_iou[0]
+            else:
+                rsu_gt_max_iou = None
+
             _teacher_tensors = [
                 torch.as_tensor(t)
                 for t in padded_voxel_points_teacher_list
@@ -822,6 +828,33 @@ def main(args):
                 box_colors = late_fusion(
                     k, late_fusion_n_agents, result, trans_matrices, box_color_map
                 )
+
+            # ── RSU AOI filter ───────────────────────────────────────────────
+            # Whenever we evaluate against RSU GT, clip predictions to the RSU's
+            # area_extents before scoring.  In late-fusion mode, vehicles detect
+            # in their own frame (±range around the vehicle) and boxes transformed
+            # into RSU frame can land far outside the RSU's ±32 m grid — those
+            # have no matching GT and count as false positives, depressing mAP.
+            # In BEV-upload (selection) mode, the model grid already enforces the
+            # bounds, so this is a no-op in practice but keeps the logic consistent.
+            #
+            # NOTE: late_fusion's NMS only filters "pred" and box_colors; "score"
+            # and "selected_idx" are left at their pre-NMS length.  Only filter
+            # arrays that are post-NMS and aligned with "pred".
+            using_rsu_gt = (args.rsu and args.selection) or (is_late_fusion and args.rsu and k == 0)
+            if using_rsu_gt and len(result[k]) > 0 and len(result[k][0][0][0]["pred"]) > 0:
+                _boxes = result[k][0][0][0]["pred"]      # (M, 1, 4, 2)
+                _centers = _boxes[:, 0, :, :].mean(axis=1)   # (M, 2)
+                _x_min, _x_max = float(config.area_extents[0][0]), float(config.area_extents[0][1])
+                _y_min, _y_max = float(config.area_extents[1][0]), float(config.area_extents[1][1])
+                _in_aoi = (
+                    (_centers[:, 0] >= _x_min) & (_centers[:, 0] <= _x_max) &
+                    (_centers[:, 1] >= _y_min) & (_centers[:, 1] <= _y_max)
+                )
+                result[k][0][0][0]["pred"] = _boxes[_in_aoi]
+                if box_colors is not None:
+                    box_colors = box_colors[_in_aoi]
+            # ── end RSU AOI filter ───────────────────────────────────────────
 
             result_temp = result[k]
 
